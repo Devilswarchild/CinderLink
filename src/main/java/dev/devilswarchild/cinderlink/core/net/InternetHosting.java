@@ -55,6 +55,30 @@ public final class InternetHosting {
         }
     }
 
+    /** Router found ahead of time (at game start), so hosting only needs the quick "open this port" request. */
+    private static volatile UpnpGateway cachedGateway;
+    private static volatile long cachedAt;
+    private static final long GATEWAY_CACHE_MS = 15 * 60_000;
+
+    /** Looks for the router in the background. Safe to call any time; failures are just a cache miss. */
+    public static void prefetchGateway() {
+        SsdpDiscovery.findGateway(DISCOVERY_TIMEOUT_MS).ifPresent(g -> {
+            cachedGateway = g;
+            cachedAt = System.currentTimeMillis();
+        });
+    }
+
+    private static Optional<UpnpGateway> gateway() {
+        UpnpGateway g = cachedGateway;
+        if (g != null && System.currentTimeMillis() - cachedAt < GATEWAY_CACHE_MS) return Optional.of(g);
+        Optional<UpnpGateway> found = SsdpDiscovery.findGateway(DISCOVERY_TIMEOUT_MS);
+        found.ifPresent(x -> {
+            cachedGateway = x;
+            cachedAt = System.currentTimeMillis();
+        });
+        return found;
+    }
+
     public static Result open(int port, boolean useUpnp, boolean useIpv6) {
         List<Problem> problems = new ArrayList<>();
         Optional<InetSocketAddress> v4 = Optional.empty();
@@ -64,7 +88,7 @@ public final class InternetHosting {
         if (!useUpnp) {
             problems.add(Problem.UPNP_DISABLED);
         } else {
-            Optional<UpnpGateway> gw = SsdpDiscovery.findGateway(DISCOVERY_TIMEOUT_MS);
+            Optional<UpnpGateway> gw = gateway();
             if (gw.isPresent() && gw.get().localAddress() instanceof Inet4Address local) {
                 lan = Optional.of(new InetSocketAddress(local, port));
             }
@@ -84,6 +108,7 @@ public final class InternetHosting {
                     }
                 } catch (UpnpException e) {
                     problems.add(Problem.ROUTER_REFUSED);
+                    cachedGateway = null; // maybe the router changed; look again next time
                 }
             }
         }

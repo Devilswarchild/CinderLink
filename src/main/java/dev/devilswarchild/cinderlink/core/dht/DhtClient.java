@@ -40,9 +40,15 @@ public final class DhtClient implements DhtStore, AutoCloseable {
             InetSocketAddress.createUnresolved("dht.libtorrent.org", 25401));
 
     static final int K = 8;
-    static final int ALPHA = 4;
+    static final int ALPHA = 6;
     static final int MAX_QUERIES = 80;
-    static final long QUERY_TIMEOUT_MS = 1500;
+    static final long QUERY_TIMEOUT_MS = 600;
+    /** Fast path: ask the nodes we already know hold a record, instead of searching the whole DHT again. */
+    static final long FAST_TIMEOUT_MS = 800;
+    /** How long a remembered route is trusted before a full search refreshes it. */
+    static final long ROUTE_TTL_MS = 120_000;
+    /** BEP 44 write tokens are typically valid 5-10 minutes; reuse them for at most this long. */
+    static final long TOKEN_TTL_MS = 240_000;
     static final long LOOKUP_TIMEOUT_MS = 10_000;
     private static final int MAX_KNOWN = 256;
 
@@ -106,16 +112,117 @@ public final class DhtClient implements DhtStore, AutoCloseable {
     /** Latest valid record for (publicKey, salt), or empty if none is found. */
     @Override
     public Optional<MutableItem> get(byte[] publicKey, byte[] salt) {
-        return lookup(MutableItem.target(publicKey, salt), publicKey, salt).best;
+        return get(publicKey, salt, ROUTE_TTL_MS, false);
+    }
+
+    @Override
+    public void warm(byte[] publicKey, byte[] salt) {
+        byte[] target = MutableItem.target(publicKey, salt);
+        stats.fullLookups.incrementAndGet();
+        remember(HexFormat.of().formatHex(target), lookup(target, publicKey, salt, false));
+    }
+
+    @Override
+    public Optional<MutableItem> get(byte[] publicKey, byte[] salt, long maxRouteAgeMs, boolean firstValueWins) {
+        byte[] target = MutableItem.target(publicKey, salt);
+        String key = HexFormat.of().formatHex(target);
+        Route route = routes.get(key);
+        if (route != null && System.currentTimeMillis() - route.foundAt < Math.min(maxRouteAgeMs, ROUTE_TTL_MS)) {
+            FastResult fast = fastGet(route, target, publicKey, salt);
+            if (fast.answered >= Math.min(2, route.nodes.size())) {
+                stats.fastGets.incrementAndGet();
+                routes.put(key, new Route(fast.refreshed, route.foundAt));
+                return fast.best;
+            }
+        }
+        stats.fullLookups.incrementAndGet();
+        Lookup l = lookup(target, publicKey, salt, firstValueWins);
+        if (!firstValueWins) remember(key, l); // an early-stopped search hasn't found the true closest nodes
+        return l.best;
+    }
+
+    // ---------------------------------------------------------------- remembered routes
+
+    /** The nodes closest to one record (with write tokens), found by the last full search. */
+    private record Route(List<Responder> nodes, long foundAt) {}
+
+    private final Map<String, Route> routes = new ConcurrentHashMap<>();
+
+    private void remember(String key, Lookup l) {
+        List<Responder> storing = l.responders.stream().filter(r -> r.token != null).limit(K).toList();
+        if (storing.size() >= 2) routes.put(key, new Route(storing, System.currentTimeMillis()));
+        else routes.remove(key);
+        if (routes.size() > 512) routes.clear(); // bounded; rebuilt on demand
+    }
+
+    private record FastResult(Optional<MutableItem> best, int answered, List<Responder> refreshed) {}
+
+    /** One round trip to the remembered nodes, in parallel. Also refreshes their write tokens. */
+    private FastResult fastGet(Route route, byte[] target, byte[] expectedKey, byte[] salt) {
+        Map<Responder, CompletableFuture<Map<String, Object>>> asks = new LinkedHashMap<>();
+        for (Responder r : route.nodes) {
+            Map<String, Object> a = new HashMap<>();
+            a.put("target", target);
+            asks.put(r, query(r.node.address(), "get", a));
+        }
+        try {
+            CompletableFuture.allOf(asks.values().toArray(CompletableFuture[]::new))
+                    .get(FAST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (Exception ignored) {
+            // use whoever answered in time
+        }
+        Optional<MutableItem> best = Optional.empty();
+        List<Responder> refreshed = new ArrayList<>();
+        int answered = 0;
+        long now = System.currentTimeMillis();
+        for (var e : asks.entrySet()) {
+            CompletableFuture<Map<String, Object>> f = e.getValue();
+            if (!f.isDone() || f.isCompletedExceptionally() || f.isCancelled()) {
+                refreshed.add(e.getKey());
+                continue;
+            }
+            Map<String, Object> r = f.getNow(null);
+            answered++;
+            stats.replies.incrementAndGet();
+            byte[] token = Bencode.bytes(r, "token");
+            refreshed.add(token != null ? new Responder(e.getKey().node, token, now) : e.getKey());
+            MutableItem item = validItem(r, target, expectedKey, salt);
+            if (item != null && (best.isEmpty() || best.get().seq() < item.seq())) best = Optional.of(item);
+        }
+        return new FastResult(best, answered, refreshed);
     }
 
     /** Stores the item on the closest nodes. Returns how many accepted it. */
     @Override
     public int put(MutableItem item) {
         if (!item.verify()) throw new IllegalArgumentException("item signature invalid");
-        Lookup l = lookup(item.target(), item.publicKey(), item.salt());
+        String key = HexFormat.of().formatHex(item.target());
+        Route route = routes.get(key);
+        long now = System.currentTimeMillis();
+        if (route != null && now - route.foundAt < ROUTE_TTL_MS) {
+            List<Responder> fresh = route.nodes.stream()
+                    .filter(r -> r.token != null && now - r.tokenAt < TOKEN_TTL_MS).toList();
+            if (fresh.size() >= 3) {
+                int ok = sendPuts(item, fresh);
+                if (ok >= 2) {
+                    stats.fastPuts.incrementAndGet();
+                    stats.putsStored.incrementAndGet();
+                    return ok;
+                }
+            }
+        }
+        stats.fullLookups.incrementAndGet();
+        Lookup l = lookup(item.target(), item.publicKey(), item.salt(), false);
+        remember(key, l);
+        int ok = sendPuts(item, l.responders);
+        if (ok > 0) stats.putsStored.incrementAndGet();
+        else stats.putsFailed.incrementAndGet();
+        return ok;
+    }
+
+    private int sendPuts(MutableItem item, List<Responder> targets) {
         List<CompletableFuture<Map<String, Object>>> puts = new ArrayList<>();
-        for (Responder r : l.responders) {
+        for (Responder r : targets) {
             if (r.token == null) continue;
             Map<String, Object> a = new HashMap<>();
             a.put("token", r.token);
@@ -130,7 +237,7 @@ public final class DhtClient implements DhtStore, AutoCloseable {
         int ok = 0;
         for (CompletableFuture<Map<String, Object>> f : puts) {
             try {
-                f.get(QUERY_TIMEOUT_MS + 500, TimeUnit.MILLISECONDS);
+                f.get(QUERY_TIMEOUT_MS + 300, TimeUnit.MILLISECONDS);
                 ok++;
             } catch (Exception ignored) {
                 // timeout or refusal from that node
@@ -150,13 +257,25 @@ public final class DhtClient implements DhtStore, AutoCloseable {
         return System.currentTimeMillis() * 16 + (seqBump.getAndIncrement() & 15);
     }
 
+    long fullLookups() {
+        return stats.fullLookups.get();
+    }
+
+    long fastOps() {
+        return stats.fastGets.get() + stats.fastPuts.get();
+    }
+
     public int knownNodeCount() {
         return known.size();
     }
 
     // ---------------------------------------------------------------- lookups
 
-    private record Responder(DhtNode node, byte[] token) {}
+    private record Responder(DhtNode node, byte[] token, long tokenAt) {
+        Responder(DhtNode node, byte[] token) {
+            this(node, token, System.currentTimeMillis());
+        }
+    }
 
     private static final class Lookup {
         final List<Responder> responders = new ArrayList<>();
@@ -167,6 +286,9 @@ public final class DhtClient implements DhtStore, AutoCloseable {
         final DhtNode node;
         boolean queried;
         boolean done;
+        boolean triedFindNode;
+        /** Didn't answer, or answered but can't store records (no token): doesn't count toward the K closest. */
+        boolean useless;
 
         Candidate(DhtNode node) {
             this.node = node;
@@ -174,6 +296,10 @@ public final class DhtClient implements DhtStore, AutoCloseable {
     }
 
     Lookup lookup(byte[] target, byte[] expectedKey, byte[] salt) {
+        return lookup(target, expectedKey, salt, false);
+    }
+
+    Lookup lookup(byte[] target, byte[] expectedKey, byte[] salt, boolean firstValueWins) {
         Lookup result = new Lookup();
         Map<InetSocketAddress, Candidate> cands = new LinkedHashMap<>();
         synchronized (known) {
@@ -194,13 +320,16 @@ public final class DhtClient implements DhtStore, AutoCloseable {
         int queries = 0;
 
         while (!closed && System.currentTimeMillis() < deadline) {
+            if (firstValueWins && result.best.isPresent()) break;
             List<Candidate> sorted = new ArrayList<>(cands.values());
             sorted.sort(byDistance);
-            // Done when the K closest nodes with known ids have all answered or failed.
-            List<Candidate> closest = sorted.stream().filter(c -> c.node.id() != null).limit(K).toList();
-            boolean converged = closest.size() >= Math.min(K, cands.size()) && !closest.isEmpty()
-                    && closest.stream().allMatch(c -> c.done);
-            if (converged && inflight.isEmpty()) break;
+            // Done when the K closest *useful* nodes (answered, and can store records) have all been asked,
+            // or nothing closer is left to ask. Dead and legacy nodes don't count.
+            List<Candidate> closest = sorted.stream().filter(c -> c.node.id() != null && !c.useless).limit(K).toList();
+            boolean nothingLeft = sorted.stream().noneMatch(c -> !c.queried);
+            boolean converged = !closest.isEmpty() && closest.stream().allMatch(c -> c.done)
+                    && (closest.size() >= K || nothingLeft);
+            if ((converged || nothingLeft) && inflight.isEmpty()) break;
 
             for (Candidate c : sorted) {
                 if (inflight.size() >= ALPHA || queries >= MAX_QUERIES) break;
@@ -209,9 +338,7 @@ public final class DhtClient implements DhtStore, AutoCloseable {
                 if (!bootstrapNode && converged) break;
                 c.queried = true;
                 queries++;
-                Map<String, Object> a = new HashMap<>();
-                a.put("target", target);
-                inflight.put(c, query(c.node.address(), "get", a));
+                inflight.put(c, bootstrapNode ? findNode(c, target) : getQuery(c, target));
             }
             if (inflight.isEmpty()) break;
 
@@ -227,15 +354,79 @@ public final class DhtClient implements DhtStore, AutoCloseable {
                 if (!e.getValue().isDone()) continue;
                 it.remove();
                 Candidate c = e.getKey();
+                CompletableFuture<Map<String, Object>> f = e.getValue();
+                if (f.isCompletedExceptionally() || f.isCancelled()) {
+                    stats.timeouts.incrementAndGet();
+                    // Nodes that don't support BEP 44 reject "get"; ask them for neighbours instead so the
+                    // lookup can keep moving toward the target.
+                    if (!c.triedFindNode && isErrorReply(f) && queries < MAX_QUERIES && inflight.size() < ALPHA) {
+                        queries++;
+                        inflight.put(c, findNode(c, target));
+                        break; // map modified; pick up remaining finished futures next loop
+                    }
+                    c.done = true;
+                    c.useless = true;
+                    continue;
+                }
                 c.done = true;
-                Map<String, Object> r = e.getValue().getNow(null);
-                if (r == null || e.getValue().isCompletedExceptionally()) continue;
+                Map<String, Object> r = f.getNow(null);
+                if (r == null) {
+                    c.useless = true;
+                    continue;
+                }
+                stats.replies.incrementAndGet();
+                if (Bencode.bytes(r, "token") == null) c.useless = true; // find_node-only node: can't store
                 handleGetReply(r, c, target, expectedKey, salt, cands, result);
             }
         }
         inflight.values().forEach(f -> f.cancel(false));
         result.responders.sort((a, b) -> DhtNode.compareDistance(target, a.node.id(), b.node.id()));
         return result;
+    }
+
+    private CompletableFuture<Map<String, Object>> getQuery(Candidate c, byte[] target) {
+        Map<String, Object> a = new HashMap<>();
+        a.put("target", target);
+        return query(c.node.address(), "get", a);
+    }
+
+    private CompletableFuture<Map<String, Object>> findNode(Candidate c, byte[] target) {
+        c.triedFindNode = true;
+        Map<String, Object> a = new HashMap<>();
+        a.put("target", target);
+        return query(c.node.address(), "find_node", a);
+    }
+
+    private static boolean isErrorReply(CompletableFuture<?> f) {
+        try {
+            f.getNow(null);
+            return false;
+        } catch (java.util.concurrent.CompletionException e) {
+            return e.getCause() instanceof DhtError;
+        } catch (java.util.concurrent.CancellationException e) {
+            return false;
+        }
+    }
+
+    /** Running counters, for the occasional diagnostic log line. */
+    public static final class Stats {
+        final java.util.concurrent.atomic.AtomicLong replies = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong timeouts = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong putsStored = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong putsFailed = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong fullLookups = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong fastGets = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong fastPuts = new java.util.concurrent.atomic.AtomicLong();
+    }
+
+    private final Stats stats = new Stats();
+
+    /** One-line summary with counts only: never addresses or keys. */
+    public String statsLine() {
+        return "DHT: " + known.size() + " nodes known, " + stats.replies.get() + " replies, "
+                + stats.timeouts.get() + " no-reply, " + stats.putsStored.get() + " records stored, "
+                + stats.putsFailed.get() + " stores failed, " + stats.fullLookups.get() + " full searches, "
+                + (stats.fastGets.get() + stats.fastPuts.get()) + " fast (remembered route)";
     }
 
     private void handleGetReply(Map<String, Object> r, Candidate c, byte[] target, byte[] expectedKey,
@@ -253,15 +444,25 @@ public final class DhtClient implements DhtStore, AutoCloseable {
             Candidate replaced = new Candidate(node);
             replaced.queried = true;
             replaced.done = true;
+            replaced.triedFindNode = c.triedFindNode;
+            replaced.useless = Bencode.bytes(r, "token") == null;
             cands.put(node.address(), replaced);
         }
+        MutableItem item = validItem(r, target, expectedKey, salt);
+        if (item != null && (result.best.isEmpty() || result.best.get().seq() < item.seq())) {
+            result.best = Optional.of(item);
+        }
+    }
+
+    /** The record in a get reply, only if it's for the key we asked about and the signature checks out. */
+    private static MutableItem validItem(Map<String, Object> r, byte[] target, byte[] expectedKey, byte[] salt) {
         byte[] k = Bencode.bytes(r, "k"), sig = Bencode.bytes(r, "sig"), v = Bencode.bytes(r, "v");
         Long seq = Bencode.integer(r, "seq");
-        if (k == null || sig == null || v == null || seq == null) return;
-        if (!Arrays.equals(k, expectedKey)) return;
+        if (k == null || sig == null || v == null || seq == null) return null;
+        if (!Arrays.equals(k, expectedKey)) return null;
         MutableItem item = new MutableItem(k, salt, seq, v, sig);
-        if (!Arrays.equals(item.target(), target) || !item.verify()) return; // forged or corrupted
-        if (result.best.isEmpty() || result.best.get().seq() < seq) result.best = Optional.of(item);
+        if (!Arrays.equals(item.target(), target) || !item.verify()) return null; // forged or corrupted
+        return item;
     }
 
     // ---------------------------------------------------------------- transport

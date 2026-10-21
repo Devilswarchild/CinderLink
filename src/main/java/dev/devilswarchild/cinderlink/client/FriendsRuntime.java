@@ -28,7 +28,7 @@ import net.neoforged.neoforge.event.GameShuttingDownEvent;
 /** Starts the friends engine once the game is up, runs it in the background, and shuts it down cleanly. */
 @EventBusSubscriber(modid = CinderLink.MODID, value = Dist.CLIENT)
 public final class FriendsRuntime {
-    private static final long TICK_SECONDS = 5;
+    private static final long TICK_MS = 1000;
     private static volatile PresenceService presence;
     private static volatile DhtClient dht;
     private static volatile String problem;
@@ -77,8 +77,9 @@ public final class FriendsRuntime {
                 th.setDaemon(true);
                 return th;
             });
-            scheduler.scheduleWithFixedDelay(FriendsRuntime::tick, 0, TICK_SECONDS, TimeUnit.SECONDS);
+            scheduler.scheduleWithFixedDelay(FriendsRuntime::tick, 0, TICK_MS, TimeUnit.MILLISECONDS);
             scheduler.scheduleWithFixedDelay(() -> client.saveNodes(dir.resolve("dht-nodes.bin")), 5, 10, TimeUnit.MINUTES);
+            java.util.concurrent.CompletableFuture.runAsync(dev.devilswarchild.cinderlink.core.net.InternetHosting::prefetchGateway);
             CinderLink.LOGGER.info("CinderLink friends list started.");
         } catch (Exception e) {
             problem = "startup";
@@ -86,11 +87,18 @@ public final class FriendsRuntime {
         }
     }
 
+    private static int ticks;
+
     private static void tick() {
         try {
             PresenceService p = presence;
-            if (p != null) p.tick();
+            if (p != null) p.tick(false);
             DhtClient d = dht;
+            ticks++;
+            // A health line soon after start, then every ~5 minutes. Counts only: no addresses, keys or names.
+            if (d != null && (ticks == 15 || ticks == 60 || ticks % 300 == 0)) {
+                CinderLink.LOGGER.info("CinderLink {}", d.statsLine());
+            }
             // No DHT nodes at all after a while means UDP is blocked here (school/work networks, some firewalls).
             problem = d != null && d.knownNodeCount() == 0 ? "network" : null;
         } catch (Throwable t) {
@@ -129,6 +137,11 @@ public final class FriendsRuntime {
             if (!CinderLinkConfig.SHOW_HOSTING_TOASTS.get() || v.state() != PresenceState.HOSTING) return;
             toast(Component.translatable("cinderlink.toast.hosting.title", v.friend().mcName()),
                     Component.literal(v.world()));
+        }
+
+        @Override
+        public void problem(String what) {
+            CinderLink.LOGGER.warn("CinderLink friends engine problem: {}", what);
         }
 
         private static void toast(Component title, Component body) {

@@ -18,8 +18,29 @@ import java.util.concurrent.ConcurrentHashMap;
 final class FakeDhtNetwork implements AutoCloseable {
     final List<FakeNode> nodes = new ArrayList<>();
 
+    enum Kind {
+        /** Supports BEP 5 and BEP 44. */
+        NORMAL,
+        /** Never answers (offline, firewalled, overloaded). */
+        SILENT,
+        /** Only BEP 5: answers find_node, rejects get/put with error 204, like bootstrap routers and older clients. */
+        LEGACY
+    }
+
     FakeDhtNetwork(int count) throws Exception {
-        for (int i = 0; i < count; i++) nodes.add(new FakeNode());
+        this(count, 0, 0, false);
+    }
+
+    /** {@code silentPercent} / {@code legacyPercent} of nodes misbehave; optionally the bootstrap node is LEGACY. */
+    FakeDhtNetwork(int count, int silentPercent, int legacyPercent, boolean legacyBootstrap) throws Exception {
+        java.util.Random r = new java.util.Random(7);
+        for (int i = 0; i < count; i++) {
+            FakeNode n = new FakeNode();
+            int roll = r.nextInt(100);
+            n.kind = roll < silentPercent ? Kind.SILENT : roll < silentPercent + legacyPercent ? Kind.LEGACY : Kind.NORMAL;
+            nodes.add(n);
+        }
+        nodes.get(0).kind = legacyBootstrap ? Kind.LEGACY : Kind.NORMAL;
         nodes.forEach(FakeNode::start);
     }
 
@@ -43,6 +64,7 @@ final class FakeDhtNetwork implements AutoCloseable {
         final Map<String, MutableItem> store = new ConcurrentHashMap<>();
         /** When set, this node answers every get with this (possibly forged) item. */
         volatile MutableItem liar;
+        volatile Kind kind = Kind.NORMAL;
 
         FakeNode() throws Exception {
             socket = new DatagramSocket(0, InetAddress.getLoopbackAddress());
@@ -62,8 +84,20 @@ final class FakeDhtNetwork implements AutoCloseable {
             return Arrays.copyOf(Keys.sha1(id, who.toString().getBytes()), 8);
         }
 
+        /** Like a real routing table, each node only knows a random slice of the network. */
+        private List<FakeNode> view;
+
+        private synchronized List<FakeNode> view() {
+            if (view == null) {
+                List<FakeNode> all = new ArrayList<>(nodes);
+                java.util.Collections.shuffle(all, new java.util.Random(java.util.Arrays.hashCode(id)));
+                view = all.subList(0, Math.max(8, all.size() * 2 / 3));
+            }
+            return view;
+        }
+
         private byte[] closestNodes(byte[] target) {
-            List<FakeNode> sorted = new ArrayList<>(nodes);
+            List<FakeNode> sorted = new ArrayList<>(view());
             sorted.sort((a, b) -> DhtNode.compareDistance(target, a.id, b.id));
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             for (FakeNode n : sorted.subList(0, Math.min(8, sorted.size()))) {
@@ -89,7 +123,13 @@ final class FakeDhtNetwork implements AutoCloseable {
                     Map<String, Object> r = new HashMap<>();
                     r.put("id", id);
                     Object reply;
-                    if ("get".equals(q)) {
+                    if (kind == Kind.SILENT) continue;
+                    if (kind == Kind.LEGACY && !"find_node".equals(q)) {
+                        reply = Map.of("t", Bencode.bytes(msg, "t"), "y", "e", "e", List.of(204L, "Method Unknown"));
+                    } else if ("find_node".equals(q)) {
+                        r.put("nodes", closestNodes(Bencode.bytes(a, "target")));
+                        reply = Map.of("t", Bencode.bytes(msg, "t"), "y", "r", "r", r);
+                    } else if ("get".equals(q)) {
                         byte[] target = Bencode.bytes(a, "target");
                         r.put("token", token(from));
                         r.put("nodes", closestNodes(target));

@@ -42,6 +42,67 @@ class DhtClientTest {
     }
 
     @Test
+    void survivesAMessyRealisticNetwork() throws Exception {
+        // Like the real DHT: the entry point only speaks find_node, a third of nodes never answer,
+        // and a fifth don't support BEP 44 records at all.
+        try (FakeDhtNetwork messy = new FakeDhtNetwork(150, 33, 20, true);
+             DhtClient a = new DhtClient(messy.bootstrap(), true);
+             DhtClient b = new DhtClient(messy.bootstrap(), true)) {
+            KeyPair key = Keys.newEd25519();
+            byte[] salt = "card".getBytes();
+            int stored = a.put(key, salt, "still works".getBytes());
+            assertTrue(stored >= 3, "stored on " + stored + " / " + a.statsLine());
+            Optional<MutableItem> got = b.get(Keys.raw(key.getPublic()), salt);
+            assertTrue(got.isPresent(), b.statsLine());
+            assertArrayEquals("still works".getBytes(), got.get().value());
+        }
+    }
+
+    @Test
+    void repeatChecksUseTheRememberedRouteAndAreFast() throws Exception {
+        try (FakeDhtNetwork messy = new FakeDhtNetwork(150, 33, 20, true);
+             DhtClient writer = new DhtClient(messy.bootstrap(), true);
+             DhtClient reader = new DhtClient(messy.bootstrap(), true)) {
+            KeyPair key = Keys.newEd25519();
+            byte[] pub = Keys.raw(key.getPublic()), salt = "p".getBytes();
+            writer.put(key, salt, "v1".getBytes());
+            assertArrayEquals("v1".getBytes(), reader.get(pub, salt).orElseThrow().value());
+            long searches = reader.fullLookups();
+
+            // The friend updates their status; we see it via one quick round trip, no new search.
+            writer.put(key, salt, "v2".getBytes());
+            long start = System.nanoTime();
+            var got = reader.get(pub, salt);
+            long ms = (System.nanoTime() - start) / 1_000_000;
+            assertArrayEquals("v2".getBytes(), got.orElseThrow().value());
+            assertEquals(searches, reader.fullLookups(), "should not have searched again");
+            assertTrue(reader.fastOps() >= 1);
+            assertTrue(ms < 900, "fast get took " + ms + " ms");
+            assertTrue(writer.fastOps() >= 1, "second put should reuse the route: " + writer.statsLine());
+        }
+    }
+
+    @Test
+    void fallsBackToAFullSearchWhenRememberedNodesDie() throws Exception {
+        try (FakeDhtNetwork net = new FakeDhtNetwork(40);
+             DhtClient c = new DhtClient(net.bootstrap(), true)) {
+            KeyPair key = Keys.newEd25519();
+            byte[] pub = Keys.raw(key.getPublic()), salt = "p".getBytes();
+            c.put(key, salt, "x".getBytes());
+            assertTrue(c.get(pub, salt).isPresent());
+            // The nodes holding the record all go offline at once.
+            byte[] target = MutableItem.target(pub, salt);
+            for (var n : net.nodes) {
+                if (n.store.containsKey(java.util.HexFormat.of().formatHex(target))) n.kind = FakeDhtNetwork.Kind.SILENT;
+            }
+            long searches = c.fullLookups();
+            c.put(key, salt, "y".getBytes()); // re-stored on the next-closest live nodes
+            assertTrue(c.fullLookups() > searches, "should have searched again");
+            assertArrayEquals("y".getBytes(), c.get(pub, salt).orElseThrow().value());
+        }
+    }
+
+    @Test
     void newerValueWins() throws Exception {
         KeyPair key = Keys.newEd25519();
         try (DhtClient a = client()) {

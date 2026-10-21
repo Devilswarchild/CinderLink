@@ -67,6 +67,7 @@ public final class SsdpDiscovery {
                     String reply = new String(p.getData(), 0, p.getLength(), StandardCharsets.US_ASCII);
                     parseLocation(reply, p.getAddress())
                             .ifPresent(loc -> found.putIfAbsent(loc, new Found(loc, local)));
+                    if (!found.isEmpty()) break; // the router answered: no need to wait out the timeout
                 }
             } catch (IOException ignored) {
                 // interface couldn't send multicast; try the next one

@@ -60,15 +60,20 @@ public final class Protocol {
         return Keys.ed25519FromSeed(Keys.sha256(bytes("cl1-inbox"), ownerSignPublic, inboxSecret, new byte[]{(byte) slot}));
     }
 
-    /** A request from {@code me} to the owner of ({@code toSign}, {@code toBox}), signed and encrypted. */
-    static byte[] sealRequest(Identity me, String mcName, UUID mcUuid, long now, byte[] toSign, byte[] toBox)
-            throws GeneralSecurityException {
+    /**
+     * A request from {@code me} to the owner of ({@code toSign}, {@code toBox}), signed and encrypted.
+     * {@code requestId} is fixed when the sender clicks Send and stays the same across automatic re-sends,
+     * so the receiver can tell "the same request again" from "a new request".
+     */
+    static byte[] sealRequest(Identity me, String mcName, UUID mcUuid, long now, long requestId, byte[] toSign,
+                              byte[] toBox) throws GeneralSecurityException {
         Map<String, Object> body = new TreeMap<>();
         body.put("k", me.signPublic());
         body.put("x", me.boxPublic());
         body.put("n", mcName);
         body.put("u", PresenceRecord.uuidBytes(mcUuid));
         body.put("t", now);
+        body.put("r", requestId);
         Map<String, Object> signed = new TreeMap<>(body);
         signed.put("to", toSign); // binds the request to its recipient so it can't be replayed elsewhere
         body.put("sig", me.sign(Bencode.encode(signed)));
@@ -81,7 +86,8 @@ public final class Protocol {
         return out;
     }
 
-    public record Request(byte[] signPublic, byte[] boxPublic, String mcName, UUID mcUuid, long timestampMs) {}
+    public record Request(byte[] signPublic, byte[] boxPublic, String mcName, UUID mcUuid, long timestampMs,
+                          long requestId) {}
 
     /** Decrypts and verifies a request addressed to {@code me}; null if it isn't valid. */
     static Request openRequest(Identity me, byte[] data) {
@@ -96,6 +102,8 @@ public final class Protocol {
                     sig = Bencode.bytes(o, "sig");
             String n = Bencode.str(o, "n");
             Long t = Bencode.integer(o, "t");
+            Long rid = Bencode.integer(o, "r");
+            if (rid == null) return null;
             if (k == null || k.length != 32 || x == null || x.length != 32 || u == null || u.length != 16
                     || sig == null || t == null || !PresenceRecord.validName(n)) return null;
             Map<String, Object> signed = new TreeMap<>();
@@ -104,9 +112,10 @@ public final class Protocol {
             signed.put("n", n);
             signed.put("u", u);
             signed.put("t", t);
+            signed.put("r", rid);
             signed.put("to", me.signPublic());
             if (!Keys.verify(k, Bencode.encode(signed), sig)) return null;
-            return new Request(k, x, n, PresenceRecord.uuid(u), t);
+            return new Request(k, x, n, PresenceRecord.uuid(u), t, rid);
         } catch (Exception e) {
             return null;
         }

@@ -26,6 +26,12 @@ public final class FriendsStore {
     private final Path dir;
     private final Map<String, Friend> friends = new LinkedHashMap<>();
     private final Set<String> blocked = ConcurrentHashMap.newKeySet();
+    /**
+     * Friend id -> ignore their requests stamped at or before this time. Old requests can sit in the DHT
+     * mailbox for a while, so without this a removed or declined person would pop straight back up.
+     */
+    private final Map<String, Long> ignoreRequestsBefore = new ConcurrentHashMap<>();
+    private static final long DISMISS_MEMORY_MS = 30L * 24 * 3600_000;
 
     private FriendsStore(Path dir) {
         this.dir = dir;
@@ -46,11 +52,16 @@ public final class FriendsStore {
             try {
                 if (p[0].equals("blocked") && p.length == 2) {
                     s.blocked.add(p[1]);
+                } else if (p[0].equals("dismissed") && p.length == 3) {
+                    s.ignoreRequestsBefore.put(p[1], Long.parseLong(p[2]));
                 } else if (p.length == 8) {
                     Friend f = new Friend(b.decode(p[1]), p[2].isEmpty() ? null : b.decode(p[2]),
                             Friend.Relation.valueOf(p[0]), p[3], UUID.fromString(p[4]),
                             p[5].isEmpty() ? null : b.decode(p[5]), Long.parseLong(p[6]));
-                    if (f.signPublic().length == 32 && PresenceRecord.validName(f.mcName())) s.friends.put(f.id(), f);
+                    // A request we sent but that isn't accepted yet has no name: they're saved as "?".
+                    boolean nameOk = PresenceRecord.validName(f.mcName())
+                            || (f.relation() == Friend.Relation.OUTGOING && "?".equals(f.mcName()));
+                    if (f.signPublic().length == 32 && nameOk) s.friends.put(f.id(), f);
                 }
             } catch (IllegalArgumentException | ArrayIndexOutOfBoundsException ignored) {
                 // skip a damaged line rather than losing the whole list
@@ -72,6 +83,9 @@ public final class FriendsStore {
               .append(f.addedAtMs()).append("|v1\n");
         }
         for (String k : blocked) sb.append("blocked|").append(k).append('\n');
+        long cutoff = System.currentTimeMillis() - DISMISS_MEMORY_MS;
+        ignoreRequestsBefore.entrySet().removeIf(e -> e.getValue() < cutoff);
+        ignoreRequestsBefore.forEach((k, t) -> sb.append("dismissed|").append(k).append('|').append(t).append('\n'));
         SecureFiles.writeAtomically(dir.resolve(FILE), sb.toString().getBytes(StandardCharsets.UTF_8));
     }
 
@@ -104,6 +118,17 @@ public final class FriendsStore {
 
     synchronized void remove(String id) {
         friends.remove(id);
+    }
+
+    /** Ignore this person's requests stamped at or before {@code untilMs}. */
+    void dismissRequestsUntil(String id, long untilMs) {
+        ignoreRequestsBefore.merge(id, untilMs, Math::max);
+    }
+
+    /** True if a request from {@code id} stamped {@code requestMs} should be ignored. */
+    boolean isDismissed(String id, long requestMs) {
+        Long t = ignoreRequestsBefore.get(id);
+        return t != null && requestMs <= t;
     }
 
     synchronized void block(String id) {

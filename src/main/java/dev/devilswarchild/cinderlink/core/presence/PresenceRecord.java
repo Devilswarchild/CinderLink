@@ -15,9 +15,19 @@ import java.util.UUID;
  * {@code addresses} is only filled when hosting AND the friend is allowed to join this session.
  */
 public record PresenceRecord(PresenceState state, String mcName, UUID mcUuid, String world,
-                             List<InetSocketAddress> addresses, long timestampMs) {
+                             List<InetSocketAddress> addresses, long timestampMs, boolean ended) {
     public static final int MAX_WORLD_NAME = 48;
     private static final int MAX_ADDRESSES = 4;
+
+    public PresenceRecord(PresenceState state, String mcName, UUID mcUuid, String world,
+                          List<InetSocketAddress> addresses, long timestampMs) {
+        this(state, mcName, mcUuid, world, addresses, timestampMs, false);
+    }
+
+    /** The last record someone writes for a friend they removed: "we're not friends any more". */
+    static PresenceRecord unfriended(String mcName, UUID mcUuid, long now) {
+        return new PresenceRecord(PresenceState.OFFLINE, mcName, mcUuid, "", List.of(), now, true);
+    }
 
     public PresenceRecord {
         world = world == null ? "" : sanitize(world);
@@ -40,6 +50,7 @@ public record PresenceRecord(PresenceState state, String mcName, UUID mcUuid, St
         }
         m.put("a", addrs);
         m.put("t", timestampMs);
+        if (ended) m.put("x", 1L);
         return Bencode.encode(m);
     }
 
@@ -61,7 +72,9 @@ public record PresenceRecord(PresenceState state, String mcName, UUID mcUuid, St
                     addrs.add(new InetSocketAddress(InetAddress.getByAddress(Arrays.copyOf(b, b.length - 2)), port));
                 }
             }
-            return new PresenceRecord(PresenceState.values()[s.intValue()], name, uuid(u), world, addrs, t);
+            Long x = Bencode.integer(o, "x");
+            boolean ended = x != null && x == 1L;
+            return new PresenceRecord(PresenceState.values()[s.intValue()], name, uuid(u), world, addrs, t, ended);
         } catch (Exception e) {
             return null;
         }

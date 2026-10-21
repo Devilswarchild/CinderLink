@@ -8,6 +8,15 @@ public final class FakeDhtNetworkAccess implements AutoCloseable {
         net = new FakeDhtNetwork(nodes);
     }
 
+    /** A realistic network: silent nodes, BEP 44-unaware nodes, and a find_node-only entry point. */
+    public static FakeDhtNetworkAccess messy(int nodes) throws Exception {
+        return new FakeDhtNetworkAccess(new FakeDhtNetwork(nodes, 33, 20, true));
+    }
+
+    private FakeDhtNetworkAccess(FakeDhtNetwork net) {
+        this.net = net;
+    }
+
     public DhtClient client() throws Exception {
         return new DhtClient(net.bootstrap(), true);
     }

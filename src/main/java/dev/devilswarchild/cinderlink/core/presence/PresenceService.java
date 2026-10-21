@@ -34,11 +34,20 @@ import java.util.function.LongSupplier;
  */
 public final class PresenceService {
     public static final long OFFLINE_AFTER_MS = 5 * 60_000;
-    static final long REPUBLISH_MS = 2 * 60_000;
-    static final long POLL_MS = 30_000;
+    /** Re-send our status even if nothing changed, so friends know we're still here. */
+    static final long REPUBLISH_MS = 60_000;
+    /** How often we check friends' status and our mailbox. Cheap: usually one round trip to known nodes. */
+    static final long POLL_MS = 2_000;
+    /** Our mailbox is re-located this often, so a request stored on slightly different nodes is never missed long. */
+    static final long INBOX_ROUTE_MS = 20_000;
+    /** Same for friends' status records. */
+    static final long PAIR_ROUTE_MS = 45_000;
     static final long CARD_MS = 30 * 60_000;
-    static final long REQUEST_RESEND_MS = 2 * 60_000;
+    /** A request is stored right away; this is only how often it's re-stored until they answer. */
+    static final long REQUEST_RESEND_MS = 30_000;
     private static final long MAX_CLOCK_SKEW_MS = 10 * 60_000;
+    /** Clock difference we tolerate between two players' computers when judging "newer than my request". */
+    private static final long ACCEPT_SKEW_MS = 60_000;
 
     /** What we're doing right now. {@code hosting} is null when not hosting. */
     public record LocalStatus(String mcName, UUID mcUuid, Hosting hosting) {}
@@ -55,6 +64,9 @@ public final class PresenceService {
         default void requestAccepted(Friend by) {}
 
         default void friendStartedHosting(FriendView view) {}
+
+        /** Something went wrong in the background. The text never contains addresses, keys or names. */
+        default void problem(String what) {}
     }
 
     public enum AddResult { SENT, INVALID_CODE, OWN_CODE, ALREADY_FRIENDS, ALREADY_SENT, ACCEPTED_THEIRS, BLOCKED }
@@ -83,7 +95,7 @@ public final class PresenceService {
         this.dht = dht;
         this.dir = dir;
         this.clock = clock;
-        this.pool = Executors.newFixedThreadPool(threads, r -> {
+        this.pool = Executors.newFixedThreadPool(Math.max(threads, 8), r -> {
             Thread t = new Thread(r, "CinderLink presence");
             t.setDaemon(true);
             return t;
@@ -132,6 +144,7 @@ public final class PresenceService {
                 }
             }
         }
+        lastRequestSent.remove(id); // a fresh request, even if we've asked this person before
         store.put(new Friend(code.identityKey(), null, Friend.Relation.OUTGOING, "?", new UUID(0, 0),
                 code.inboxSecret(), clock.getAsLong()));
         persist();
@@ -147,13 +160,35 @@ public final class PresenceService {
         });
     }
 
+    /**
+     * Declining ignores that request and its automatic re-sends. If they send a brand-new request later,
+     * it shows up normally. (Block is the permanent option.)
+     */
     public void decline(String id) {
+        // For an incoming request, addedAtMs holds the sender's request id.
+        store.get(id).filter(f -> f.relation() == Friend.Relation.INCOMING)
+                .ifPresent(f -> store.dismissRequestsUntil(id, f.addedAtMs()));
         store.remove(id);
+        lastRequestSent.remove(id);
         persist();
     }
 
+    /** Removing ignores any request of theirs from before now (old ones linger in the DHT mailbox). */
     public void remove(String id) {
+        // Leave a final "not friends any more" note where they read our status, so a stale record can't be
+        // mistaken for acceptance later, and their game knows to drop us too.
+        store.get(id).filter(f -> f.relation() == Friend.Relation.FRIEND).ifPresent(f -> {
+            byte[] secret = pairSecret(f);
+            LocalStatus l = local;
+            if (secret == null || l == null) return;
+            PresenceRecord bye = PresenceRecord.unfriended(l.mcName(), l.mcUuid(), clock.getAsLong());
+            pool.submit(() -> dht.put(MutableItem.sign(Protocol.pairKey(secret, me.signPublic()), Protocol.PAIR_SALT,
+                    nextSeq(), Protocol.sealRecord(secret, me.signPublic(), bye))));
+        });
         store.remove(id);
+        store.dismissRequestsUntil(id, clock.getAsLong());
+        lastRequestSent.remove(id);
+        lastPublished.remove(id);
         latest.remove(id);
         pairSecrets.remove(id);
         persist();
@@ -204,52 +239,100 @@ public final class PresenceService {
     // ------------------------------------------------------------------ the engine
 
     /** One round of network work. Blocking; call from a background scheduler. */
+    /** One round of network work, waiting for all of it to finish (handy for tests). */
     public void tick() {
+        tick(true);
+    }
+
+    /**
+     * Starts this round's network work. With {@code wait=false} (the game), it returns immediately: each kind
+     * of check runs on its own, so a quick one-hop status check never sits behind a slow full search.
+     * A check that's still running from an earlier round is simply not started again.
+     */
+    public void tick(boolean wait) {
         long now = clock.getAsLong();
         cycle++;
         List<Future<?>> jobs = new ArrayList<>();
         if (now - lastCard >= CARD_MS) {
             lastCard = now;
-            jobs.add(pool.submit(() -> dht.put(Protocol.card(me, nextSeq()))));
+            submit(jobs, "card", () -> dht.put(Protocol.card(me, nextSeq())));
         }
         boolean poll = now - lastPoll >= POLL_MS;
+        boolean kick = dirty; // something just changed (sent, accepted, started hosting): act now
         if (poll) {
             lastPoll = now;
             for (int slot = 0; slot < Protocol.INBOX_SLOTS; slot++) {
                 int s = slot;
-                jobs.add(pool.submit(() -> readInbox(s)));
+                submit(jobs, "inbox" + s, () -> readInbox(s));
             }
         }
-        if (poll) {
-            for (Friend f : store.withRelation(Friend.Relation.OUTGOING)) {
-                jobs.add(pool.submit(() -> handleOutgoing(f, now)));
-            }
+        for (Friend f : store.withRelation(Friend.Relation.OUTGOING)) {
+            // Waiting on an answer we've already sent is a quick check, so do it every tick for snappy accepts.
+            // Anything needing a full search (their card, first send) stays on the poll timer.
+            boolean quick = f.boxPublic() != null && lastRequestSent.containsKey(f.id());
+            if (poll || kick || quick) submit(jobs, "out" + f.id(), () -> handleOutgoing(f, now));
         }
         boolean publishAll = dirty;
         dirty = false;
         for (Friend f : store.withRelation(Friend.Relation.FRIEND)) {
             if (publishAll || now - lastPublished.getOrDefault(f.id(), Long.MIN_VALUE / 2) >= REPUBLISH_MS) {
-                jobs.add(pool.submit(() -> publishTo(f, now)));
+                submit(jobs, "pub" + f.id(), () -> publishTo(f, now));
             }
-            if (poll) jobs.add(pool.submit(() -> readFrom(f, now)));
+            if (poll) submit(jobs, "read" + f.id(), () -> readFrom(f, now));
         }
+        if (!wait) return;
         for (Future<?> j : jobs) {
             try {
                 j.get(30, TimeUnit.SECONDS);
             } catch (Exception ignored) {
-                // a slow or failed lookup just retries next round
+                // errors are reported by submit(); slow lookups just retry next round
             }
         }
     }
 
+    private final Map<String, Future<?>> running = new ConcurrentHashMap<>();
+
+    /** Runs {@code job} unless the same kind of job is still going; reports real errors instead of hiding them. */
+    private void submit(List<Future<?>> jobs, String key, Runnable job) {
+        Future<?> prev = running.get(key);
+        if (prev != null && !prev.isDone()) return;
+        Future<?> f = pool.submit(() -> {
+            try {
+                job.run();
+            } catch (RuntimeException e) {
+                StackTraceElement at = e.getStackTrace().length > 0 ? e.getStackTrace()[0] : null;
+                listener.problem(e.getClass().getSimpleName()
+                        + (at == null ? "" : " at " + at.getFileName() + ":" + at.getLineNumber()));
+            }
+        });
+        running.put(key, f);
+        jobs.add(f);
+    }
+
     private void readInbox(int slot) {
         KeyPair inbox = Protocol.inboxKey(me.signPublic(), me.inboxSecret(), slot);
-        dht.get(Keys.raw(inbox.getPublic()), Protocol.INBOX_SALT).ifPresent(item -> {
+        dht.get(Keys.raw(inbox.getPublic()), Protocol.INBOX_SALT, INBOX_ROUTE_MS, false).ifPresent(item -> {
+            if (item.value().length == 0) return; // already cleared
+            handleRequest(item);
+            // Whatever we decided, the request has been handled: empty the slot so it can't come back.
+            // (A sender still waiting re-sends every 30 seconds, so nothing real is lost.)
+            clearInboxSlot(inbox, item.seq());
+        });
+    }
+
+    private void clearInboxSlot(KeyPair inbox, long handledSeq) {
+        long seq = Math.max(handledSeq + 1, nextSeq()); // must outrank the request, whatever their clock says
+        dht.put(MutableItem.sign(inbox, Protocol.INBOX_SALT, seq, new byte[0]));
+    }
+
+    private void handleRequest(MutableItem item) {
+        {
             Protocol.Request req = Protocol.openRequest(me, item.value());
             if (req == null || Arrays.equals(req.signPublic(), me.signPublic())) return;
             long now = clock.getAsLong();
             if (Math.abs(now - req.timestampMs()) > 24 * 3600_000L) return; // stale or bogus time
             String id = HexFormat.of().formatHex(req.signPublic());
+            if (store.isDismissed(id, req.requestId())) return; // a request we already dealt with
             Optional<Friend> existing = store.get(id);
             if (existing.isPresent() && existing.get().relation() == Friend.Relation.OUTGOING) {
                 // We'd both added each other: that's mutual consent, so become friends straight away.
@@ -260,21 +343,33 @@ public final class PresenceService {
                 listener.requestAccepted(f);
                 return;
             }
+            // addedAtMs holds the sender's request id, so Decline can ignore exactly this request.
             Friend incoming = new Friend(req.signPublic(), req.boxPublic(), Friend.Relation.INCOMING, req.mcName(),
-                    req.mcUuid(), null, now);
+                    req.mcUuid(), null, req.requestId());
             if (store.addIncoming(incoming)) {
                 persist();
                 listener.requestReceived(incoming);
+                // While they decide, find where our shared status record lives so Accept is one quick hop.
+                warmPair(incoming, me.signPublic());
             }
-        });
+        }
     }
 
     private void handleOutgoing(Friend f, long now) {
         LocalStatus l = local;
         if (l == null) return;
         Friend current = f;
+        boolean sendDue = now - lastRequestSent.getOrDefault(current.id(), Long.MIN_VALUE / 2) >= REQUEST_RESEND_MS;
+        int slot = Math.floorMod(Arrays.hashCode(me.signPublic()) + cycle, Protocol.INBOX_SLOTS);
+        KeyPair inbox = Protocol.inboxKey(current.signPublic(), current.inboxSecret(), slot);
+        java.util.concurrent.CompletableFuture<Void> warming = null;
         if (current.boxPublic() == null) {
-            Optional<MutableItem> card = dht.get(current.signPublic(), Protocol.CARD_SALT);
+            // Their mailbox location comes from the code alone, so find it while we fetch their card.
+            if (sendDue) {
+                warming = java.util.concurrent.CompletableFuture.runAsync(
+                        () -> dht.warm(Keys.raw(inbox.getPublic()), Protocol.INBOX_SALT));
+            }
+            Optional<MutableItem> card = dht.get(current.signPublic(), Protocol.CARD_SALT, PAIR_ROUTE_MS, true);
             byte[] box = card.map(Protocol::cardBoxKey).orElse(null);
             if (box == null) return; // they haven't been online recently; try again later
             current = new Friend(current.signPublic(), box, Friend.Relation.OUTGOING, current.mcName(),
@@ -282,9 +377,10 @@ public final class PresenceService {
             store.put(current);
             persist();
         }
-        // Accepted? Then they're publishing a record for us.
-        PresenceRecord theirs = fetchRecord(current);
-        if (theirs != null) {
+        // A request we've never sent can't have been accepted yet: send it first, check for acceptance later.
+        boolean everSent = lastRequestSent.containsKey(current.id());
+        PresenceRecord theirs = everSent ? fetchRecord(current) : null;
+        if (theirs != null && !theirs.ended() && theirs.timestampMs() >= current.addedAtMs() - ACCEPT_SKEW_MS) {
             Friend accepted = current.with(Friend.Relation.FRIEND, current.boxPublic(), theirs.mcName(), theirs.mcUuid());
             store.put(accepted);
             latest.put(accepted.id(), theirs);
@@ -293,13 +389,21 @@ public final class PresenceService {
             listener.requestAccepted(accepted);
             return;
         }
-        if (now - lastRequestSent.getOrDefault(current.id(), Long.MIN_VALUE / 2) < REQUEST_RESEND_MS) return;
+        if (!sendDue) return;
         try {
-            byte[] sealed = Protocol.sealRequest(me, l.mcName(), l.mcUuid(), now, current.signPublic(), current.boxPublic());
-            int slot = Math.floorMod(Arrays.hashCode(me.signPublic()) + cycle, Protocol.INBOX_SLOTS);
-            KeyPair inbox = Protocol.inboxKey(current.signPublic(), current.inboxSecret(), slot);
+            byte[] sealed = Protocol.sealRequest(me, l.mcName(), l.mcUuid(), now, current.addedAtMs(),
+                    current.signPublic(), current.boxPublic());
+            if (warming != null) {
+                try {
+                    warming.get(10, TimeUnit.SECONDS); // usually finished alongside the card fetch
+                } catch (Exception ignored) {
+                    // put() will search on its own
+                }
+            }
             if (dht.put(MutableItem.sign(inbox, Protocol.INBOX_SALT, nextSeq(), sealed)) > 0) {
                 lastRequestSent.put(current.id(), now);
+                // Get ready to spot their acceptance with quick checks instead of full searches.
+                warmPair(current, current.signPublic());
             }
         } catch (GeneralSecurityException ignored) {
             // their card key was bad; nothing we can do
@@ -330,6 +434,17 @@ public final class PresenceService {
         PresenceRecord r = fetchRecord(f);
         if (r == null || r.timestampMs() > now + MAX_CLOCK_SKEW_MS) return;
         PresenceRecord prev = latest.get(f.id());
+        // The DHT always returns their highest-version record, so a goodbye note is final even if its clock
+        // stamp ties with their last update.
+        if (r.ended()) {
+            // They removed us. Drop them quietly; ignore their older requests too.
+            store.remove(f.id());
+            store.dismissRequestsUntil(f.id(), now);
+            latest.remove(f.id());
+            pairSecrets.remove(f.id());
+            persist();
+            return;
+        }
         if (prev != null && prev.timestampMs() >= r.timestampMs()) return;
         latest.put(f.id(), r);
         boolean wasJoinable = prev != null && prev.state() == PresenceState.HOSTING && !prev.addresses().isEmpty()
@@ -348,9 +463,17 @@ public final class PresenceService {
         byte[] secret = pairSecret(f);
         if (secret == null) return null;
         KeyPair theirKey = Protocol.pairKey(secret, f.signPublic());
-        return dht.get(Keys.raw(theirKey.getPublic()), Protocol.PAIR_SALT)
+        return dht.get(Keys.raw(theirKey.getPublic()), Protocol.PAIR_SALT, PAIR_ROUTE_MS, false)
                 .map(item -> Protocol.openRecord(secret, f.signPublic(), item.value()))
                 .orElse(null);
+    }
+
+    /** Pre-finds the DHT nodes for the shared record written by {@code author}, in the background. */
+    private void warmPair(Friend f, byte[] author) {
+        byte[] secret = pairSecret(f);
+        if (secret == null) return;
+        KeyPair key = Protocol.pairKey(secret, author);
+        java.util.concurrent.CompletableFuture.runAsync(() -> dht.warm(Keys.raw(key.getPublic()), Protocol.PAIR_SALT));
     }
 
     private byte[] pairSecret(Friend f) {
