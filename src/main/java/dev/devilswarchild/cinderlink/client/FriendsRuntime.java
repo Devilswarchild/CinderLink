@@ -81,6 +81,9 @@ public final class FriendsRuntime {
             scheduler.scheduleWithFixedDelay(() -> client.saveNodes(dir.resolve("dht-nodes.bin")), 5, 10, TimeUnit.MINUTES);
             java.util.concurrent.CompletableFuture.runAsync(dev.devilswarchild.cinderlink.core.net.InternetHosting::prefetchGateway);
             svc.setImmediate(true);
+            // Friends' faces, ready before the friends list is first opened.
+            Minecraft.getInstance().execute(() -> Skins.prefetch(store.all().stream()
+                    .map(dev.devilswarchild.cinderlink.core.presence.Friend::mcUuid).toList()));
             CinderLink.LOGGER.info("CinderLink friends list started.");
         } catch (Exception e) {
             problem = "startup";

@@ -19,6 +19,10 @@ public final class CinderLinkConfig {
             .define("enableFriends", true);
     public static final ModConfigSpec.BooleanValue SHOW_HOSTING_TOASTS = BUILDER
             .define("showHostingToasts", true);
+    static { BUILDER.pop(); BUILDER.push("menu"); }
+    public static final ModConfigSpec.BooleanValue SHOW_PLAYER_MODEL = BUILDER
+            .comment("Show your player model to the right of the main menu buttons.")
+            .define("showPlayerModel", true);
     static { BUILDER.pop(); }
 
     public static final ModConfigSpec SPEC = BUILDER.build();

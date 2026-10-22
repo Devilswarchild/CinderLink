@@ -1,6 +1,7 @@
 package dev.devilswarchild.cinderlink.client;
 
 import dev.devilswarchild.cinderlink.CinderLink;
+import dev.devilswarchild.cinderlink.CinderLinkConfig;
 import dev.devilswarchild.cinderlink.core.presence.Friend;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.PauseScreen;
@@ -30,5 +31,20 @@ public final class FriendsButtons {
                 : Component.translatable("cinderlink.button.friends");
         event.addListener(Button.builder(label, b -> screen.getMinecraft().setScreen(new FriendsScreen(screen)))
                 .bounds(6, 6, 80, 20).build());
+        if (title && CinderLinkConfig.SHOW_PLAYER_MODEL.get()) addPlayerModel(event, screen);
+        // Get friends' faces ready now, so the friends list shows them straight away.
+        FriendsRuntime.presence().ifPresent(p -> Skins.prefetch(p.store().all().stream()
+                .map(Friend::mcUuid).toList()));
+    }
+
+    /** Your player model to the right of the main menu buttons, if there's room. */
+    private static void addPlayerModel(ScreenEvent.Init.Post event, Screen screen) {
+        int buttonsTop = screen.height / 4 + 48;  // where vanilla puts the first title-screen button
+        int height = 104;                        // from the first button to the bottom of the last row
+        int width = 56;
+        int x = screen.width / 2 + 100 + 24;     // just right of the 200-wide button column
+        if (x + width > screen.width - 4 || buttonsTop + height > screen.height - 14) return; // too small
+        event.addListener(new PlayerModelWidget(x, buttonsTop, width, height,
+                screen.getMinecraft().getEntityModels()));
     }
 }

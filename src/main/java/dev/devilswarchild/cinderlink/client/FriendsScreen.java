@@ -283,9 +283,12 @@ public final class FriendsScreen extends Screen {
                 case ONLINE -> ONLINE;
                 default -> OFFLINE;
             };
-            g.fill(left + 2, top + 7, left + 9, top + 14, color);
-            if (v.state() == PresenceState.HOSTING) g.fill(left + 4, top + 5, left + 7, top + 7, 0xFFFFD27F); // ember glow
-            g.drawString(font, v.friend().mcName(), left + 14, top + 3, 0xFFFFFFFF);
+            // Their face, greyed out when offline, with a small status light in the corner.
+            Skins.drawFace(g, v.friend().mcUuid(), left + 2, top + 2, 18, v.state() == PresenceState.OFFLINE);
+            g.fill(left + 15, top + 15, left + 22, top + 22, 0xFF000000);
+            g.fill(left + 16, top + 16, left + 21, top + 21, color);
+            if (v.state() == PresenceState.HOSTING) g.fill(left + 17, top + 14, left + 20, top + 16, 0xFFFFD27F); // ember glow
+            g.drawString(font, v.friend().mcName(), left + 26, top + 3, 0xFFFFFFFF);
             Component status = switch (v.state()) {
                 case HOSTING -> v.canJoin()
                         ? Component.translatable("cinderlink.state.hosting", v.world())
@@ -293,7 +296,7 @@ public final class FriendsScreen extends Screen {
                 case ONLINE -> Component.translatable("cinderlink.state.online");
                 default -> Component.translatable("cinderlink.state.offline");
             };
-            g.drawString(font, font.plainSubstrByWidth(status.getString(), width - 140), left + 14, top + 13,
+            g.drawString(font, font.plainSubstrByWidth(status.getString(), width - 152), left + 26, top + 13,
                     0xFF9A9A9A);
             renderButtons(g, top, left, width, mouseX, mouseY, pt);
         }
@@ -322,9 +325,10 @@ public final class FriendsScreen extends Screen {
         @Override
         public void render(GuiGraphics g, int index, int top, int left, int width, int height, int mouseX, int mouseY,
                            boolean hovering, float pt) {
-            g.drawString(font, v.friend().mcName(), left + 4, top + 3, 0xFFFFFFFF);
+            Skins.drawFace(g, v.friend().mcUuid(), left + 2, top + 2, 18, false);
+            g.drawString(font, v.friend().mcName(), left + 26, top + 3, 0xFFFFFFFF);
             g.drawString(font, Component.translatable("cinderlink.friends.request_id", v.friend().fingerprint()),
-                    left + 4, top + 13, 0xFF9A9A9A);
+                    left + 26, top + 13, 0xFF9A9A9A);
             renderButtons(g, top, left, width, mouseX, mouseY, pt);
         }
     }
@@ -343,9 +347,12 @@ public final class FriendsScreen extends Screen {
         @Override
         public void render(GuiGraphics g, int index, int top, int left, int width, int height, int mouseX, int mouseY,
                            boolean hovering, float pt) {
+            // We don't know whose code this is until they accept: a plain "?" head.
+            g.fill(left + 2, top + 2, left + 20, top + 20, 0xFF3A3A3A);
+            g.drawCenteredString(font, "?", left + 11, top + 7, 0xFFAAAAAA);
             g.drawString(font, Component.translatable("cinderlink.friends.pending", v.friend().fingerprint()),
-                    left + 4, top + 3, 0xFFCCCCCC);
-            g.drawString(font, Component.translatable("cinderlink.friends.pending.hint"), left + 4, top + 13, 0xFF808080);
+                    left + 26, top + 3, 0xFFCCCCCC);
+            g.drawString(font, Component.translatable("cinderlink.friends.pending.hint"), left + 26, top + 13, 0xFF808080);
             renderButtons(g, top, left, width, mouseX, mouseY, pt);
         }
     }
