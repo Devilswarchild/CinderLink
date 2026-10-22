@@ -80,6 +80,7 @@ public final class FriendsRuntime {
             scheduler.scheduleWithFixedDelay(FriendsRuntime::tick, 0, TICK_MS, TimeUnit.MILLISECONDS);
             scheduler.scheduleWithFixedDelay(() -> client.saveNodes(dir.resolve("dht-nodes.bin")), 5, 10, TimeUnit.MINUTES);
             java.util.concurrent.CompletableFuture.runAsync(dev.devilswarchild.cinderlink.core.net.InternetHosting::prefetchGateway);
+            svc.setImmediate(true);
             CinderLink.LOGGER.info("CinderLink friends list started.");
         } catch (Exception e) {
             problem = "startup";
@@ -142,6 +143,11 @@ public final class FriendsRuntime {
         @Override
         public void problem(String what) {
             CinderLink.LOGGER.warn("CinderLink friends engine problem: {}", what);
+        }
+
+        @Override
+        public void timing(String what) {
+            CinderLink.LOGGER.info("CinderLink timing: {}", what);
         }
 
         private static void toast(Component title, Component body) {

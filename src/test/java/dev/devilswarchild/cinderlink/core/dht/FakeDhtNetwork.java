@@ -17,6 +17,14 @@ import java.util.concurrent.ConcurrentHashMap;
 /** A small in-process Mainline DHT (BEP 5 + 44) on localhost, for testing the client against real packets. */
 final class FakeDhtNetwork implements AutoCloseable {
     final List<FakeNode> nodes = new ArrayList<>();
+    /** Simulated network delay per reply (random between min and max), like real internet round trips. */
+    volatile long minDelayMs, maxDelayMs;
+    private final java.util.concurrent.ScheduledExecutorService wire =
+            java.util.concurrent.Executors.newScheduledThreadPool(2, r -> {
+                Thread t = new Thread(r, "fake wire");
+                t.setDaemon(true);
+                return t;
+            });
 
     enum Kind {
         /** Supports BEP 5 and BEP 44. */
@@ -55,6 +63,7 @@ final class FakeDhtNetwork implements AutoCloseable {
 
     @Override
     public void close() {
+        wire.shutdownNow();
         nodes.forEach(n -> n.socket.close());
     }
 
@@ -161,7 +170,19 @@ final class FakeDhtNetwork implements AutoCloseable {
                         continue;
                     }
                     byte[] out = Bencode.encode(reply);
-                    socket.send(new DatagramPacket(out, out.length, from));
+                    long delay = maxDelayMs <= 0 ? 0
+                            : minDelayMs + java.util.concurrent.ThreadLocalRandom.current().nextLong(maxDelayMs - minDelayMs + 1);
+                    if (delay == 0) {
+                        socket.send(new DatagramPacket(out, out.length, from));
+                    } else {
+                        wire.schedule(() -> {
+                            try {
+                                socket.send(new DatagramPacket(out, out.length, from));
+                            } catch (Exception ignored) {
+                                // closed
+                            }
+                        }, delay, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    }
                 } catch (Exception e) {
                     // closed or junk
                 }

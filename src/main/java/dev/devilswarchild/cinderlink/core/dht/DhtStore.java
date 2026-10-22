@@ -18,4 +18,9 @@ public interface DhtStore {
 
     /** Finds (and remembers) the nodes for a record ahead of time, so a later put is a single round trip. */
     default void warm(byte[] publicKey, byte[] salt) {}
+
+    /** For timing logs: how this record is currently reached (counts and ages only, never addresses). */
+    default String routeInfo(byte[] publicKey, byte[] salt) {
+        return "n/a";
+    }
 }

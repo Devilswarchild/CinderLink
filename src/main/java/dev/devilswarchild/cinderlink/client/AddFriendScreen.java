@@ -31,6 +31,8 @@ public final class AddFriendScreen extends Screen {
         codeBox.setResponder(s -> {
             send.active = !s.isBlank();
             message = Component.empty();
+            // Find them on the network while the player reaches for Send (nothing is sent yet).
+            FriendsRuntime.presence().ifPresent(p -> p.prepare(s));
         });
         addRenderableWidget(codeBox);
         send = addRenderableWidget(Button.builder(Component.translatable("cinderlink.add.send"), b -> submit())

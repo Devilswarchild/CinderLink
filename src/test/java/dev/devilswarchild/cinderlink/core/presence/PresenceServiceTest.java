@@ -203,6 +203,27 @@ class PresenceServiceTest {
     }
 
     @Test
+    void reAddingAfterBothRemovedWorks() throws Exception {
+        Player a = new Player("Ann"), b = new Player("Ben");
+        befriend(a, b);
+        a.svc.remove(b.idHex()); // both click the X: each leaves a "removed" note for the other
+        b.svc.remove(a.idHex());
+        rounds(3, a, b);
+        assertEquals(PresenceService.AddResult.SENT, a.svc.addByCode(b.code()));
+        rounds(2, a, b);
+        b.svc.accept(a.idHex());
+        // Ben's game checks Ann's status before Ann has noticed the accept: all it finds is her old note.
+        clock.addAndGet(PresenceService.POLL_MS);
+        b.svc.tick();
+        assertNotNull(b.view(a), "Ben dropped Ann over her old 'removed' note");
+        rounds(3, a, b);
+        assertNotNull(a.view(b), "Ann never saw the accept");
+        assertNotNull(b.view(a), "Ben lost Ann");
+        assertEquals(Friend.Relation.FRIEND, a.view(b).friend().relation());
+        assertEquals(Friend.Relation.FRIEND, b.view(a).friend().relation());
+    }
+
+    @Test
     void removingSomeoneRemovesYouFromTheirListToo() throws Exception {
         Player a = new Player("Ann"), b = new Player("Ben");
         befriend(a, b);
@@ -335,13 +356,17 @@ class PresenceServiceTest {
             var s2 = new PresenceService(i2, FriendsStore.load(d2), c2, d2, System::currentTimeMillis, 4);
             s1.setLocal(new PresenceService.LocalStatus("Ann", UUID.randomUUID(), null));
             s2.setLocal(new PresenceService.LocalStatus("Ben", UUID.randomUUID(), null));
+            s1.setImmediate(true); // like the game: act on changes right away
+            s2.setImmediate(true);
             var got = new java.util.concurrent.CountDownLatch(1);
             var accepted = new java.util.concurrent.CountDownLatch(1);
             s2.setListener(new PresenceService.Listener() {
                 @Override public void requestReceived(Friend from) { got.countDown(); }
+                @Override public void timing(String what) { System.out.println("Ben timing: " + what); }
             });
             s1.setListener(new PresenceService.Listener() {
                 @Override public void requestAccepted(Friend by) { accepted.countDown(); }
+                @Override public void timing(String what) { System.out.println("Ann timing: " + what); }
             });
             var ticker = java.util.concurrent.Executors.newScheduledThreadPool(2);
             // Exactly like the game: non-blocking ticks once a second.
@@ -349,6 +374,8 @@ class PresenceServiceTest {
             ticker.scheduleWithFixedDelay(() -> s2.tick(false), 0, 1, java.util.concurrent.TimeUnit.SECONDS);
             try {
                 Thread.sleep(4000); // both games finish starting up (cards published, mailbox routes found)
+                s1.prepare(i2.code().format()); // Ann pastes Ben's code...
+                Thread.sleep(1500);             // ...and reaches for Send
                 long t0 = System.nanoTime();
                 s1.addByCode(i2.code().format());
                 assertTrue(got.await(15, java.util.concurrent.TimeUnit.SECONDS), "request never arrived");

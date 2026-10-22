@@ -33,8 +33,12 @@ class DhtClientTest {
         byte[] salt = "presence".getBytes();
         try (DhtClient a = client(); DhtClient b = client()) {
             int stored = a.put(key, salt, "hello friend".getBytes());
-            assertTrue(stored >= 6, "stored on " + stored);
-            assertTrue(net.nodesStoring(MutableItem.target(Keys.raw(key.getPublic()), salt)) >= 6);
+            // put() returns once a few nodes confirm; the rest finish storing in the background.
+            assertTrue(stored >= DhtClient.PUT_CONFIRMATIONS, "stored on " + stored);
+            byte[] target = MutableItem.target(Keys.raw(key.getPublic()), salt);
+            long deadline = System.currentTimeMillis() + 3_000;
+            while (net.nodesStoring(target) < 6 && System.currentTimeMillis() < deadline) Thread.sleep(20);
+            assertTrue(net.nodesStoring(target) >= 6, "only " + net.nodesStoring(target) + " nodes stored it");
             Optional<MutableItem> got = b.get(Keys.raw(key.getPublic()), salt);
             assertTrue(got.isPresent());
             assertArrayEquals("hello friend".getBytes(), got.get().value());
@@ -79,6 +83,72 @@ class DhtClientTest {
             assertTrue(reader.fastOps() >= 1);
             assertTrue(ms < 900, "fast get took " + ms + " ms");
             assertTrue(writer.fastOps() >= 1, "second put should reuse the route: " + writer.statsLine());
+        }
+    }
+
+    @Test
+    void routesInUseAreRenewedInTheBackground() throws Exception {
+        try (FakeDhtNetwork messy = new FakeDhtNetwork(150, 33, 20, true);
+             DhtClient writer = new DhtClient(messy.bootstrap(), true);
+             DhtClient reader = new DhtClient(messy.bootstrap(), true)) {
+            writer.refreshAtMs = 1_000; // instead of 75 seconds
+            reader.refreshAtMs = 1_000;
+            var key = Keys.newEd25519();
+            byte[] salt = "renew".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            assertTrue(writer.put(key, salt, "v1".getBytes()) > 0);
+            assertTrue(reader.get(Keys.raw(key.getPublic()), salt).isPresent());
+            long deadline = System.currentTimeMillis() + 15_000;
+            while ((writer.renewals() == 0 || reader.renewals() == 0) && System.currentTimeMillis() < deadline) {
+                Thread.sleep(200);
+            }
+            assertTrue(writer.renewals() > 0, "writer route not renewed: " + writer.statsLine());
+            assertTrue(reader.renewals() > 0, "reader route not renewed: " + reader.statsLine());
+            // Renewed routes still give the quick path, and the reader sees the writer's update.
+            long fast = writer.fastOps();
+            assertTrue(writer.put(key, salt, "v2".getBytes()) > 0);
+            assertTrue(writer.fastOps() > fast, writer.statsLine());
+            assertEquals("v2", new String(reader.get(Keys.raw(key.getPublic()), salt).orElseThrow().value()));
+        }
+    }
+
+    @Test
+    void storeDuringARunningSearchJoinsItAndLandsEarly() throws Exception {
+        // Like the real network: a third of nodes never answer, replies take 100-400 ms.
+        try (FakeDhtNetwork slow = new FakeDhtNetwork(300, 33, 10, true);
+             DhtClient writer = new DhtClient(slow.bootstrap(), true);
+             DhtClient reader = new DhtClient(slow.bootstrap(), true)) {
+            slow.minDelayMs = 100;
+            slow.maxDelayMs = 400;
+            KeyPair key = Keys.newEd25519();
+            byte[] salt = "mailbox".getBytes();
+            byte[] pub = Keys.raw(key.getPublic());
+            reader.get(pub, salt); // the reader already watches its mailbox (remembered route)
+            writer.warm(Keys.raw(Keys.newEd25519().getPublic()), salt); // writer knows some of the network
+
+            // The code is pasted: a search for the mailbox starts. Send is clicked 300 ms later.
+            long searchesBefore = writer.fullLookups();
+            Thread warming = new Thread(() -> writer.warm(pub, salt));
+            long t0 = System.currentTimeMillis();
+            warming.start();
+            Thread.sleep(300);
+            long sendAt = System.currentTimeMillis();
+            Thread putter = new Thread(() -> writer.put(key, salt, "hi".getBytes()));
+            putter.start();
+            long seenAt = -1;
+            while (System.currentTimeMillis() - sendAt < 15_000) {
+                if (reader.get(pub, salt).isPresent()) {
+                    seenAt = System.currentTimeMillis();
+                    break;
+                }
+                Thread.sleep(50);
+            }
+            putter.join(15_000);
+            warming.join(15_000);
+            long searchDone = System.currentTimeMillis();
+            System.out.println("SLOWNET reader saw it " + (seenAt - sendAt) + " ms after Send; search+store finished "
+                    + (searchDone - t0) + " ms after paste; " + writer.statsLine());
+            assertTrue(seenAt > 0, "reader never saw the record");
+            assertEquals(searchesBefore + 1, writer.fullLookups(), "Send should join the running search, not start another");
         }
     }
 

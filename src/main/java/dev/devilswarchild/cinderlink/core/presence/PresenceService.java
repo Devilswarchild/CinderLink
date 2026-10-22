@@ -36,12 +36,15 @@ public final class PresenceService {
     public static final long OFFLINE_AFTER_MS = 5 * 60_000;
     /** Re-send our status even if nothing changed, so friends know we're still here. */
     static final long REPUBLISH_MS = 60_000;
-    /** How often we check friends' status and our mailbox. Cheap: usually one round trip to known nodes. */
+    /** How often we check our mailbox (and retry unsent requests). Cheap: one round trip to known nodes. */
     static final long POLL_MS = 2_000;
-    /** Our mailbox is re-located this often, so a request stored on slightly different nodes is never missed long. */
-    static final long INBOX_ROUTE_MS = 20_000;
-    /** Same for friends' status records. */
-    static final long PAIR_ROUTE_MS = 45_000;
+    /** How often we check friends' status. Just under the game's 1-second tick, so it runs every tick. */
+    static final long FRIEND_POLL_MS = 900;
+    /**
+     * Remembered routes are kept fresh in the background by the DHT client, so reads never force a full search;
+     * this is only the upper bound if that upkeep falls behind.
+     */
+    static final long ROUTE_MAX_AGE_MS = 120_000;
     static final long CARD_MS = 30 * 60_000;
     /** A request is stored right away; this is only how often it's re-stored until they answer. */
     static final long REQUEST_RESEND_MS = 30_000;
@@ -67,6 +70,9 @@ public final class PresenceService {
 
         /** Something went wrong in the background. The text never contains addresses, keys or names. */
         default void problem(String what) {}
+
+        /** How long a step took, for troubleshooting speed. Durations and counts only: no addresses, keys or names. */
+        default void timing(String what) {}
     }
 
     public enum AddResult { SENT, INVALID_CODE, OWN_CODE, ALREADY_FRIENDS, ALREADY_SENT, ACCEPTED_THEIRS, BLOCKED }
@@ -86,6 +92,17 @@ public final class PresenceService {
     private volatile Listener listener = new Listener() {};
     private volatile long lastCard = Long.MIN_VALUE / 2;
     private volatile long lastPoll = Long.MIN_VALUE / 2;
+    private volatile long lastFriendPoll = Long.MIN_VALUE / 2;
+    /** In the game: act on a change (hosting, Send, Accept) right away instead of at the next 1-second tick. */
+    private volatile boolean immediate;
+    /** Timing notes for the log: when a code was pasted / Send was clicked / the card lookup finished, by friend id. */
+    private final Map<String, Long> pastedAt = new ConcurrentHashMap<>();
+    private final Map<String, Long> cardReadyAt = new ConcurrentHashMap<>();
+    private final Map<String, Long> sendClickedAt = new ConcurrentHashMap<>();
+    /** For timing logs: when each of our mailbox slots was last checked and found empty. */
+    private final long[] lastEmptyCheck = new long[Protocol.INBOX_SLOTS];
+    /** Cards being looked up ahead of time (from a pasted code), by friend id. */
+    private final Map<String, java.util.concurrent.CompletableFuture<byte[]>> prepared = new ConcurrentHashMap<>();
     private volatile boolean dirty = true;
     private int cycle;
 
@@ -109,8 +126,63 @@ public final class PresenceService {
     public void setLocal(LocalStatus status) {
         if (!Objects.equals(status, local)) {
             local = status;
-            dirty = true;
+            changed();
         }
+    }
+
+    /** Turns on acting immediately when something changes (the game does; tests drive ticks by hand). */
+    public void setImmediate(boolean on) {
+        immediate = on;
+    }
+
+    private void changed() {
+        dirty = true;
+        if (immediate) {
+            try {
+                pool.execute(() -> tick(false));
+            } catch (java.util.concurrent.RejectedExecutionException ignored) {
+                // shutting down
+            }
+        }
+    }
+
+    /**
+     * Called as a code is pasted, before Send: finds that person's card and mailbox in the background,
+     * so pressing Send is a single quick round trip. Nothing is sent to them until Send.
+     */
+    public void prepare(String text) {
+        CinderCode code;
+        try {
+            code = CinderCode.parse(text);
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+        if (Arrays.equals(code.identityKey(), me.signPublic())) return;
+        String id = HexFormat.of().formatHex(code.identityKey());
+        if (store.get(id).isPresent() || store.isBlocked(id) || prepared.containsKey(id)) return;
+        if (prepared.size() > 16) prepared.clear();
+        long pasted = System.currentTimeMillis();
+        pastedAt.put(id, pasted);
+        KeyPair inbox = Protocol.inboxKey(code.identityKey(), code.inboxSecret(), firstSlot());
+        java.util.concurrent.CompletableFuture.runAsync(
+                () -> dht.warm(Keys.raw(inbox.getPublic()), Protocol.INBOX_SALT), pool);
+        prepared.put(id, java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            byte[] box = dht.get(code.identityKey(), Protocol.CARD_SALT, ROUTE_MAX_AGE_MS, true)
+                    .map(Protocol::cardBoxKey).orElse(null);
+            cardReadyAt.put(id, System.currentTimeMillis());
+            listener.timing("friend's card " + (box == null ? "NOT found" : "found") + " "
+                    + secs(System.currentTimeMillis() - pasted) + " after the code was pasted");
+            return box;
+        }, pool));
+    }
+
+    private static String secs(long ms) {
+        return String.format(java.util.Locale.ROOT, "%.1fs", ms / 1000.0);
+    }
+
+    /** The mailbox slot our first request to anyone goes to (fixed, so it can be found ahead of time). */
+    private int firstSlot() {
+        return Math.floorMod(Arrays.hashCode(me.signPublic()), Protocol.INBOX_SLOTS);
     }
 
     public LocalStatus local() {
@@ -148,7 +220,8 @@ public final class PresenceService {
         store.put(new Friend(code.identityKey(), null, Friend.Relation.OUTGOING, "?", new UUID(0, 0),
                 code.inboxSecret(), clock.getAsLong()));
         persist();
-        dirty = true;
+        sendClickedAt.put(id, System.currentTimeMillis());
+        changed();
         return AddResult.SENT;
     }
 
@@ -156,7 +229,7 @@ public final class PresenceService {
         store.get(id).filter(f -> f.relation() == Friend.Relation.INCOMING).ifPresent(f -> {
             store.put(f.with(Friend.Relation.FRIEND, f.boxPublic(), f.mcName(), f.mcUuid()));
             persist();
-            dirty = true;
+            changed();
         });
     }
 
@@ -250,6 +323,21 @@ public final class PresenceService {
      * A check that's still running from an earlier round is simply not started again.
      */
     public void tick(boolean wait) {
+        List<Future<?>> jobs;
+        synchronized (this) { // the game's timer and an immediate kick may both call this
+            jobs = schedule();
+        }
+        if (!wait) return;
+        for (Future<?> j : jobs) {
+            try {
+                j.get(30, TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+                // errors are reported by submit(); slow lookups just retry next round
+            }
+        }
+    }
+
+    private List<Future<?>> schedule() {
         long now = clock.getAsLong();
         cycle++;
         List<Future<?>> jobs = new ArrayList<>();
@@ -272,22 +360,17 @@ public final class PresenceService {
             boolean quick = f.boxPublic() != null && lastRequestSent.containsKey(f.id());
             if (poll || kick || quick) submit(jobs, "out" + f.id(), () -> handleOutgoing(f, now));
         }
+        boolean friendPoll = now - lastFriendPoll >= FRIEND_POLL_MS;
+        if (friendPoll) lastFriendPoll = now;
         boolean publishAll = dirty;
         dirty = false;
         for (Friend f : store.withRelation(Friend.Relation.FRIEND)) {
             if (publishAll || now - lastPublished.getOrDefault(f.id(), Long.MIN_VALUE / 2) >= REPUBLISH_MS) {
                 submit(jobs, "pub" + f.id(), () -> publishTo(f, now));
             }
-            if (poll) submit(jobs, "read" + f.id(), () -> readFrom(f, now));
+            if (friendPoll) submit(jobs, "read" + f.id(), () -> readFrom(f, now));
         }
-        if (!wait) return;
-        for (Future<?> j : jobs) {
-            try {
-                j.get(30, TimeUnit.SECONDS);
-            } catch (Exception ignored) {
-                // errors are reported by submit(); slow lookups just retry next round
-            }
-        }
+        return jobs;
     }
 
     private final Map<String, Future<?>> running = new ConcurrentHashMap<>();
@@ -311,9 +394,15 @@ public final class PresenceService {
 
     private void readInbox(int slot) {
         KeyPair inbox = Protocol.inboxKey(me.signPublic(), me.inboxSecret(), slot);
-        dht.get(Keys.raw(inbox.getPublic()), Protocol.INBOX_SALT, INBOX_ROUTE_MS, false).ifPresent(item -> {
+        Optional<MutableItem> got = dht.get(Keys.raw(inbox.getPublic()), Protocol.INBOX_SALT, ROUTE_MAX_AGE_MS, false);
+        if (got.isEmpty() || got.get().value().length == 0) {
+            synchronized (lastEmptyCheck) {
+                lastEmptyCheck[slot] = clock.getAsLong();
+            }
+        }
+        got.ifPresent(item -> {
             if (item.value().length == 0) return; // already cleared
-            handleRequest(item);
+            handleRequest(item, slot, Keys.raw(inbox.getPublic()));
             // Whatever we decided, the request has been handled: empty the slot so it can't come back.
             // (A sender still waiting re-sends every 30 seconds, so nothing real is lost.)
             clearInboxSlot(inbox, item.seq());
@@ -325,7 +414,7 @@ public final class PresenceService {
         dht.put(MutableItem.sign(inbox, Protocol.INBOX_SALT, seq, new byte[0]));
     }
 
-    private void handleRequest(MutableItem item) {
+    private void handleRequest(MutableItem item, int slot, byte[] inboxPublic) {
         {
             Protocol.Request req = Protocol.openRequest(me, item.value());
             if (req == null || Arrays.equals(req.signPublic(), me.signPublic())) return;
@@ -348,6 +437,14 @@ public final class PresenceService {
                     req.mcUuid(), null, req.requestId());
             if (store.addIncoming(incoming)) {
                 persist();
+                long lastEmpty;
+                synchronized (lastEmptyCheck) {
+                    lastEmpty = lastEmptyCheck[slot];
+                }
+                listener.timing("friend request found in mailbox " + slot + ", " + secs(now - req.timestampMs())
+                        + " after they sent it by their clock (clocks between PCs can differ a little); "
+                        + "this mailbox last came back empty " + (lastEmpty == 0 ? "never" : secs(now - lastEmpty) + " ago")
+                        + "; " + dht.routeInfo(inboxPublic, Protocol.INBOX_SALT));
                 listener.requestReceived(incoming);
                 // While they decide, find where our shared status record lives so Accept is one quick hop.
                 warmPair(incoming, me.signPublic());
@@ -360,17 +457,36 @@ public final class PresenceService {
         if (l == null) return;
         Friend current = f;
         boolean sendDue = now - lastRequestSent.getOrDefault(current.id(), Long.MIN_VALUE / 2) >= REQUEST_RESEND_MS;
-        int slot = Math.floorMod(Arrays.hashCode(me.signPublic()) + cycle, Protocol.INBOX_SLOTS);
+        boolean firstSend = !lastRequestSent.containsKey(current.id());
+        // The first send goes to a fixed slot that may already have been found when the code was pasted;
+        // re-sends rotate through the slots in case one is jammed.
+        int slot = firstSend ? firstSlot()
+                : Math.floorMod(Arrays.hashCode(me.signPublic()) + cycle, Protocol.INBOX_SLOTS);
         KeyPair inbox = Protocol.inboxKey(current.signPublic(), current.inboxSecret(), slot);
-        java.util.concurrent.CompletableFuture<Void> warming = null;
         if (current.boxPublic() == null) {
-            // Their mailbox location comes from the code alone, so find it while we fetch their card.
-            if (sendDue) {
-                warming = java.util.concurrent.CompletableFuture.runAsync(
-                        () -> dht.warm(Keys.raw(inbox.getPublic()), Protocol.INBOX_SALT));
+            java.util.concurrent.CompletableFuture<byte[]> ready = prepared.remove(current.id());
+            byte[] box = null;
+            if (ready != null && firstSend) {
+                Long clicked = sendClickedAt.get(current.id());
+                Long pasted = pastedAt.get(current.id());
+                listener.timing("Send clicked " + (pasted == null || clicked == null ? "?" : secs(clicked - pasted))
+                        + " after pasting; card lookup " + (ready.isDone() ? "already finished" : "still running"));
             }
-            Optional<MutableItem> card = dht.get(current.signPublic(), Protocol.CARD_SALT, PAIR_ROUTE_MS, true);
-            byte[] box = card.map(Protocol::cardBoxKey).orElse(null);
+            if (ready != null) {
+                try {
+                    box = ready.get(10, TimeUnit.SECONDS); // usually already done while they reached for Send
+                } catch (Exception ignored) {
+                    // look it up below
+                }
+            } else if (sendDue) {
+                // Their mailbox location comes from the code alone, so find it while we fetch their card.
+                java.util.concurrent.CompletableFuture.runAsync(
+                        () -> dht.warm(Keys.raw(inbox.getPublic()), Protocol.INBOX_SALT), pool);
+            }
+            if (box == null) {
+                box = dht.get(current.signPublic(), Protocol.CARD_SALT, ROUTE_MAX_AGE_MS, true)
+                        .map(Protocol::cardBoxKey).orElse(null);
+            }
             if (box == null) return; // they haven't been online recently; try again later
             current = new Friend(current.signPublic(), box, Friend.Relation.OUTGOING, current.mcName(),
                     current.mcUuid(), current.inboxSecret(), current.addedAtMs());
@@ -381,6 +497,8 @@ public final class PresenceService {
         boolean everSent = lastRequestSent.containsKey(current.id());
         PresenceRecord theirs = everSent ? fetchRecord(current) : null;
         if (theirs != null && !theirs.ended() && theirs.timestampMs() >= current.addedAtMs() - ACCEPT_SKEW_MS) {
+            listener.timing("our request was accepted; their acceptance is " + secs(now - theirs.timestampMs())
+                    + " old by their clock (clocks between PCs can differ a little)");
             Friend accepted = current.with(Friend.Relation.FRIEND, current.boxPublic(), theirs.mcName(), theirs.mcUuid());
             store.put(accepted);
             latest.put(accepted.id(), theirs);
@@ -393,14 +511,21 @@ public final class PresenceService {
         try {
             byte[] sealed = Protocol.sealRequest(me, l.mcName(), l.mcUuid(), now, current.addedAtMs(),
                     current.signPublic(), current.boxPublic());
-            if (warming != null) {
-                try {
-                    warming.get(10, TimeUnit.SECONDS); // usually finished alongside the card fetch
-                } catch (Exception ignored) {
-                    // put() will search on its own
-                }
+            // No need to wait for the mailbox search started earlier: put() joins it and stores the request
+            // on each close node the moment the search reaches it.
+            long putStart = System.currentTimeMillis();
+            int stored = dht.put(MutableItem.sign(inbox, Protocol.INBOX_SALT, nextSeq(), sealed));
+            if (firstSend) {
+                Long clicked = sendClickedAt.remove(current.id());
+                long done = System.currentTimeMillis();
+                listener.timing("friend request " + (stored > 0 ? "stored" : "NOT stored") + " on " + stored
+                        + " nodes (mailbox " + slot + "): store took " + secs(done - putStart)
+                        + ", " + (clicked == null ? "?" : secs(done - clicked)) + " after Send was clicked; "
+                        + dht.routeInfo(Keys.raw(inbox.getPublic()), Protocol.INBOX_SALT));
+                pastedAt.remove(current.id());
+                cardReadyAt.remove(current.id());
             }
-            if (dht.put(MutableItem.sign(inbox, Protocol.INBOX_SALT, nextSeq(), sealed)) > 0) {
+            if (stored > 0) {
                 lastRequestSent.put(current.id(), now);
                 // Get ready to spot their acceptance with quick checks instead of full searches.
                 warmPair(current, current.signPublic());
@@ -433,6 +558,9 @@ public final class PresenceService {
     private void readFrom(Friend f, long now) {
         PresenceRecord r = fetchRecord(f);
         if (r == null || r.timestampMs() > now + MAX_CLOCK_SKEW_MS) return;
+        // Anything written before this friendship began (the request was sent) is left over from an earlier
+        // one, e.g. the "removed" note from when one of us clicked X. It says nothing about us now.
+        if (r.ended() ? r.timestampMs() < f.addedAtMs() : r.timestampMs() < f.addedAtMs() - ACCEPT_SKEW_MS) return;
         PresenceRecord prev = latest.get(f.id());
         // The DHT always returns their highest-version record, so a goodbye note is final even if its clock
         // stamp ties with their last update.
@@ -450,6 +578,8 @@ public final class PresenceService {
         boolean wasJoinable = prev != null && prev.state() == PresenceState.HOSTING && !prev.addresses().isEmpty()
                 && now - prev.timestampMs() < OFFLINE_AFTER_MS;
         if (r.state() == PresenceState.HOSTING && !r.addresses().isEmpty() && !wasJoinable) {
+            listener.timing("friend started hosting; their update is " + secs(now - r.timestampMs())
+                    + " old by their clock (clocks between PCs can differ a little)");
             views().stream().filter(v -> v.friend().id().equals(f.id())).findFirst()
                     .ifPresent(listener::friendStartedHosting);
         }
@@ -463,7 +593,7 @@ public final class PresenceService {
         byte[] secret = pairSecret(f);
         if (secret == null) return null;
         KeyPair theirKey = Protocol.pairKey(secret, f.signPublic());
-        return dht.get(Keys.raw(theirKey.getPublic()), Protocol.PAIR_SALT, PAIR_ROUTE_MS, false)
+        return dht.get(Keys.raw(theirKey.getPublic()), Protocol.PAIR_SALT, ROUTE_MAX_AGE_MS, false)
                 .map(item -> Protocol.openRecord(secret, f.signPublic(), item.value()))
                 .orElse(null);
     }

@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -50,6 +51,18 @@ public final class DhtClient implements DhtStore, AutoCloseable {
     /** BEP 44 write tokens are typically valid 5-10 minutes; reuse them for at most this long. */
     static final long TOKEN_TTL_MS = 240_000;
     static final long LOOKUP_TIMEOUT_MS = 10_000;
+    /** Records are stored on (and read from) this many of the closest nodes, so writer and reader overlap. */
+    static final int STORE_NODES = 12;
+    /** A store counts as done once this many nodes confirm it; the others finish in the background. */
+    static final int PUT_CONFIRMATIONS = 3;
+    /** Routes in active use are renewed in the background once they are this old, well before they expire. */
+    static final long REFRESH_AT_MS = 75_000;
+    /** A record counts as "in use" (and is kept warm) while it was read or written this recently. */
+    static final long HOT_FOR_MS = 10 * 60_000;
+    /** How often the background renewal looks for routes to renew. */
+    static final long MAINTAIN_EVERY_MS = 3_000;
+    /** At most this many background renewals at once, so they never crowd out real work. */
+    static final int MAX_REFRESHING = 3;
     private static final int MAX_KNOWN = 256;
 
     private final DatagramSocket socket;
@@ -87,6 +100,7 @@ public final class DhtClient implements DhtStore, AutoCloseable {
         this.receiver = new Thread(this::receiveLoop, "CinderLink DHT");
         receiver.setDaemon(true);
         receiver.start();
+        maintainer.scheduleWithFixedDelay(this::maintain, MAINTAIN_EVERY_MS, MAINTAIN_EVERY_MS, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -118,14 +132,16 @@ public final class DhtClient implements DhtStore, AutoCloseable {
     @Override
     public void warm(byte[] publicKey, byte[] salt) {
         byte[] target = MutableItem.target(publicKey, salt);
-        stats.fullLookups.incrementAndGet();
-        remember(HexFormat.of().formatHex(target), lookup(target, publicKey, salt, false));
+        String key = HexFormat.of().formatHex(target);
+        touch(key, publicKey, salt);
+        remember(key, shared(key, target, publicKey, salt, null));
     }
 
     @Override
     public Optional<MutableItem> get(byte[] publicKey, byte[] salt, long maxRouteAgeMs, boolean firstValueWins) {
         byte[] target = MutableItem.target(publicKey, salt);
         String key = HexFormat.of().formatHex(target);
+        if (!firstValueWins) touch(key, publicKey, salt); // one-off lookups (friend codes) aren't kept warm
         Route route = routes.get(key);
         if (route != null && System.currentTimeMillis() - route.foundAt < Math.min(maxRouteAgeMs, ROUTE_TTL_MS)) {
             FastResult fast = fastGet(route, target, publicKey, salt);
@@ -135,10 +151,24 @@ public final class DhtClient implements DhtStore, AutoCloseable {
                 return fast.best;
             }
         }
-        stats.fullLookups.incrementAndGet();
-        Lookup l = lookup(target, publicKey, salt, firstValueWins);
-        if (!firstValueWins) remember(key, l); // an early-stopped search hasn't found the true closest nodes
+        if (firstValueWins) {
+            // An early-stopped search hasn't found the true closest nodes, so it isn't shared or remembered.
+            stats.fullLookups.incrementAndGet();
+            return lookup(target, publicKey, salt, true).best;
+        }
+        Lookup l = shared(key, target, publicKey, salt, null);
+        remember(key, l);
         return l.best;
+    }
+
+    @Override
+    public String routeInfo(byte[] publicKey, byte[] salt) {
+        Route r = routes.get(HexFormat.of().formatHex(MutableItem.target(publicKey, salt)));
+        String key = HexFormat.of().formatHex(MutableItem.target(publicKey, salt));
+        Long landed = landedAfter.remove(key);
+        String l = landed == null ? "" : "; landed on the closest nodes " + landed + "ms after the store began";
+        if (r == null) return "no remembered route" + l;
+        return "route of " + r.nodes.size() + " nodes, " + (System.currentTimeMillis() - r.foundAt) / 1000 + "s old" + l;
     }
 
     // ---------------------------------------------------------------- remembered routes
@@ -148,8 +178,73 @@ public final class DhtClient implements DhtStore, AutoCloseable {
 
     private final Map<String, Route> routes = new ConcurrentHashMap<>();
 
+    /** A record we're actively using: keep its route fresh in the background. */
+    private record Hot(byte[] publicKey, byte[] salt, long touchedAt) {}
+
+    private final Map<String, Hot> hot = new ConcurrentHashMap<>();
+    /** {@link #REFRESH_AT_MS}, adjustable so tests don't have to wait over a minute. */
+    volatile long refreshAtMs = REFRESH_AT_MS;
+    private final Map<String, Boolean> refreshing = new ConcurrentHashMap<>();
+    private final java.util.concurrent.ScheduledExecutorService maintainer =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "CinderLink DHT upkeep");
+                t.setDaemon(true);
+                return t;
+            });
+    private final java.util.concurrent.ExecutorService refresher = Executors.newFixedThreadPool(MAX_REFRESHING, r -> {
+        Thread t = new Thread(r, "CinderLink DHT refresh");
+        t.setDaemon(true);
+        return t;
+    });
+
+    private void touch(String key, byte[] publicKey, byte[] salt) {
+        hot.put(key, new Hot(publicKey, salt, System.currentTimeMillis()));
+        if (hot.size() > 256) hot.clear(); // bounded; whatever is still in use comes straight back
+    }
+
+    /**
+     * Background upkeep: renews the route of every record in use before it expires, so reads and writes
+     * (Accept, start hosting, a new request) always take the quick one-round-trip path.
+     */
+    private void maintain() {
+        if (closed) return;
+        try {
+            long now = System.currentTimeMillis();
+            hot.entrySet().removeIf(e -> now - e.getValue().touchedAt > HOT_FOR_MS);
+            // Oldest routes first; missing routes count as oldest.
+            List<Map.Entry<String, Hot>> due = new ArrayList<>();
+            for (var e : hot.entrySet()) {
+                Route r = routes.get(e.getKey());
+                if ((r == null || now - r.foundAt >= refreshAtMs) && !refreshing.containsKey(e.getKey())) due.add(e);
+            }
+            due.sort(java.util.Comparator.comparingLong(e -> {
+                Route r = routes.get(e.getKey());
+                return r == null ? 0 : r.foundAt;
+            }));
+            for (var e : due) {
+                if (refreshing.size() >= MAX_REFRESHING) break;
+                String key = e.getKey();
+                Hot h = e.getValue();
+                refreshing.put(key, Boolean.TRUE);
+                refresher.execute(() -> {
+                    try {
+                        if (closed) return;
+                        stats.renewals.incrementAndGet();
+                        remember(key, shared(key, MutableItem.target(h.publicKey, h.salt), h.publicKey, h.salt, null));
+                    } catch (RuntimeException ignored) {
+                        // next round tries again
+                    } finally {
+                        refreshing.remove(key);
+                    }
+                });
+            }
+        } catch (RuntimeException ignored) {
+            // upkeep must never stop
+        }
+    }
+
     private void remember(String key, Lookup l) {
-        List<Responder> storing = l.responders.stream().filter(r -> r.token != null).limit(K).toList();
+        List<Responder> storing = l.responders.stream().filter(r -> r.token != null).limit(STORE_NODES).toList();
         if (storing.size() >= 2) routes.put(key, new Route(storing, System.currentTimeMillis()));
         else routes.remove(key);
         if (routes.size() > 512) routes.clear(); // bounded; rebuilt on demand
@@ -197,6 +292,7 @@ public final class DhtClient implements DhtStore, AutoCloseable {
     public int put(MutableItem item) {
         if (!item.verify()) throw new IllegalArgumentException("item signature invalid");
         String key = HexFormat.of().formatHex(item.target());
+        touch(key, item.publicKey(), item.salt());
         Route route = routes.get(key);
         long now = System.currentTimeMillis();
         if (route != null && now - route.foundAt < ROUTE_TTL_MS) {
@@ -211,39 +307,141 @@ public final class DhtClient implements DhtStore, AutoCloseable {
                 }
             }
         }
-        stats.fullLookups.incrementAndGet();
-        Lookup l = lookup(item.target(), item.publicKey(), item.salt(), false);
+        // No usable route: search, storing the record on each close node the moment the search reaches it.
+        Lookup l = shared(key, item.target(), item.publicKey(), item.salt(), item);
         remember(key, l);
-        int ok = sendPuts(item, l.responders);
+        int ok = awaitStored(l, item, now);
         if (ok > 0) stats.putsStored.incrementAndGet();
         else stats.putsFailed.incrementAndGet();
         return ok;
+    }
+
+    // ---------------------------------------------------------------- shared searches, storing as we go
+
+    /** Searches in progress, by record: a second request for the same record joins the first search. */
+    private final Map<String, Lookup> searching = new ConcurrentHashMap<>();
+    /** For timing logs: when the last store of a record reached enough of its closest nodes. */
+    private final Map<String, Long> landedAfter = new ConcurrentHashMap<>();
+
+    /**
+     * Full search for a record, shared: if one is already running (say, started when a code was pasted),
+     * this joins it instead of starting over. {@code carry}, if given, is stored on close nodes as they're found.
+     */
+    private Lookup shared(String key, byte[] target, byte[] expectedKey, byte[] salt, MutableItem carry) {
+        Lookup mine = new Lookup();
+        if (carry != null) mine.carry.add(carry);
+        Lookup running = searching.putIfAbsent(key, mine);
+        if (running != null) {
+            if (carry != null) attach(running, carry);
+            try {
+                return running.finished.get(LOOKUP_TIMEOUT_MS + 2_000, TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                // that search failed or hung; do our own below
+            }
+            mine = new Lookup();
+            if (carry != null) mine.carry.add(carry);
+        }
+        stats.fullLookups.incrementAndGet();
+        try {
+            return runLookup(mine, target, expectedKey, salt, false);
+        } finally {
+            searching.remove(key, mine);
+            mine.finished.complete(mine);
+        }
+    }
+
+    /** Adds a record to store to a search that's already running, and stores it on close nodes found so far. */
+    private void attach(Lookup l, MutableItem item) {
+        synchronized (l) {
+            if (!l.carry.contains(item)) l.carry.add(item);
+            for (Responder r : l.eligible) storeOn(l, item, r);
+        }
+    }
+
+    /** Sends one store, once per (record, node). Caller holds the lookup's lock. */
+    private void storeOn(Lookup l, MutableItem item, Responder r) {
+        if (r.token == null) return;
+        Map<InetSocketAddress, CompletableFuture<Map<String, Object>>> sent =
+                l.stores.computeIfAbsent(item, k -> new HashMap<>());
+        if (sent.containsKey(r.node.address())) return;
+        sent.put(r.node.address(), putQuery(r, item).whenComplete((res, err) -> {
+            if (err == null) l.ackedAt.computeIfAbsent(item, k -> new ConcurrentHashMap<>())
+                    .put(r.node.address(), System.currentTimeMillis());
+        }));
+    }
+
+    /** Waits until the record is on enough of the closest nodes. Returns how many of them confirmed. */
+    private int awaitStored(Lookup l, MutableItem item, long started) {
+        List<Responder> closest = l.responders.stream().filter(r -> r.token != null).limit(STORE_NODES).toList();
+        List<CompletableFuture<Map<String, Object>>> mine = new ArrayList<>();
+        synchronized (l) {
+            for (Responder r : closest) storeOn(l, item, r);
+            Map<InetSocketAddress, CompletableFuture<Map<String, Object>>> sent = l.stores.get(item);
+            for (Responder r : closest) mine.add(sent.get(r.node.address()));
+        }
+        if (mine.isEmpty()) return 0;
+        int need = Math.min(PUT_CONFIRMATIONS, mine.size());
+        AtomicInteger ok = new AtomicInteger();
+        AtomicInteger finished = new AtomicInteger();
+        CompletableFuture<Void> enough = new CompletableFuture<>();
+        for (CompletableFuture<Map<String, Object>> f : mine) {
+            f.whenComplete((r, e) -> {
+                if (e == null && ok.incrementAndGet() >= need) enough.complete(null);
+                if (finished.incrementAndGet() == mine.size()) enough.complete(null);
+            });
+        }
+        try {
+            enough.get(QUERY_TIMEOUT_MS + 300, TimeUnit.MILLISECONDS);
+        } catch (Exception ignored) {
+            // whoever confirmed in time counts
+        }
+        // When did it actually land on `need` of the closest nodes? (Often well before the search finished.)
+        Map<InetSocketAddress, Long> acks = l.ackedAt.getOrDefault(item, Map.of());
+        List<Long> times = closest.stream().map(r -> acks.get(r.node.address()))
+                .filter(java.util.Objects::nonNull).sorted().toList();
+        if (times.size() >= need) {
+            landedAfter.put(HexFormat.of().formatHex(item.target()), times.get(need - 1) - started);
+        }
+        return ok.get();
+    }
+
+    private CompletableFuture<Map<String, Object>> putQuery(Responder r, MutableItem item) {
+        Map<String, Object> a = new HashMap<>();
+        a.put("token", r.token);
+        a.put("k", item.publicKey());
+        a.put("seq", item.seq());
+        a.put("sig", item.signature());
+        a.put("v", item.value());
+        if (item.salt().length > 0) a.put("salt", item.salt());
+        return query(r.node.address(), "put", a);
     }
 
     private int sendPuts(MutableItem item, List<Responder> targets) {
         List<CompletableFuture<Map<String, Object>>> puts = new ArrayList<>();
         for (Responder r : targets) {
             if (r.token == null) continue;
-            Map<String, Object> a = new HashMap<>();
-            a.put("token", r.token);
-            a.put("k", item.publicKey());
-            a.put("seq", item.seq());
-            a.put("sig", item.signature());
-            a.put("v", item.value());
-            if (item.salt().length > 0) a.put("salt", item.salt());
-            puts.add(query(r.node.address(), "put", a));
-            if (puts.size() >= K) break;
+            puts.add(putQuery(r, item));
+            if (puts.size() >= STORE_NODES) break;
         }
-        int ok = 0;
+        if (puts.isEmpty()) return 0;
+        // Done as soon as a few nodes confirm (or all have answered): the rest finish in the background,
+        // so one slow node never holds up "you're hosting" or a friend request.
+        int need = Math.min(PUT_CONFIRMATIONS, puts.size());
+        AtomicInteger ok = new AtomicInteger();
+        AtomicInteger finished = new AtomicInteger();
+        CompletableFuture<Void> enough = new CompletableFuture<>();
         for (CompletableFuture<Map<String, Object>> f : puts) {
-            try {
-                f.get(QUERY_TIMEOUT_MS + 300, TimeUnit.MILLISECONDS);
-                ok++;
-            } catch (Exception ignored) {
-                // timeout or refusal from that node
-            }
+            f.whenComplete((r, e) -> {
+                if (e == null && ok.incrementAndGet() >= need) enough.complete(null);
+                if (finished.incrementAndGet() == puts.size()) enough.complete(null);
+            });
         }
-        return ok;
+        try {
+            enough.get(QUERY_TIMEOUT_MS + 300, TimeUnit.MILLISECONDS);
+        } catch (Exception ignored) {
+            // whoever confirmed in time counts
+        }
+        return ok.get();
     }
 
     public int put(KeyPair key, byte[] salt, byte[] value) {
@@ -259,6 +457,10 @@ public final class DhtClient implements DhtStore, AutoCloseable {
 
     long fullLookups() {
         return stats.fullLookups.get();
+    }
+
+    long renewals() {
+        return stats.renewals.get();
     }
 
     long fastOps() {
@@ -280,6 +482,14 @@ public final class DhtClient implements DhtStore, AutoCloseable {
     private static final class Lookup {
         final List<Responder> responders = new ArrayList<>();
         Optional<MutableItem> best = Optional.empty();
+        /** Records to store on close nodes as the search finds them. Guarded by this. */
+        final List<MutableItem> carry = new ArrayList<>();
+        /** Stores sent so far, per record and node. Guarded by this. */
+        final Map<MutableItem, Map<InetSocketAddress, CompletableFuture<Map<String, Object>>>> stores = new HashMap<>();
+        final Map<MutableItem, Map<InetSocketAddress, Long>> ackedAt = new ConcurrentHashMap<>();
+        /** Nodes that currently look like they're among the closest (and can store). Guarded by this. */
+        List<Responder> eligible = List.of();
+        final CompletableFuture<Lookup> finished = new CompletableFuture<>();
     }
 
     private static final class Candidate {
@@ -300,7 +510,10 @@ public final class DhtClient implements DhtStore, AutoCloseable {
     }
 
     Lookup lookup(byte[] target, byte[] expectedKey, byte[] salt, boolean firstValueWins) {
-        Lookup result = new Lookup();
+        return runLookup(new Lookup(), target, expectedKey, salt, firstValueWins);
+    }
+
+    private Lookup runLookup(Lookup result, byte[] target, byte[] expectedKey, byte[] salt, boolean firstValueWins) {
         Map<InetSocketAddress, Candidate> cands = new LinkedHashMap<>();
         synchronized (known) {
             known.values().stream()
@@ -378,6 +591,7 @@ public final class DhtClient implements DhtStore, AutoCloseable {
                 if (Bencode.bytes(r, "token") == null) c.useless = true; // find_node-only node: can't store
                 handleGetReply(r, c, target, expectedKey, salt, cands, result);
             }
+            storeAsWeGo(result, cands, byDistance);
         }
         inflight.values().forEach(f -> f.cancel(false));
         result.responders.sort((a, b) -> DhtNode.compareDistance(target, a.node.id(), b.node.id()));
@@ -417,6 +631,7 @@ public final class DhtClient implements DhtStore, AutoCloseable {
         final java.util.concurrent.atomic.AtomicLong fullLookups = new java.util.concurrent.atomic.AtomicLong();
         final java.util.concurrent.atomic.AtomicLong fastGets = new java.util.concurrent.atomic.AtomicLong();
         final java.util.concurrent.atomic.AtomicLong fastPuts = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong renewals = new java.util.concurrent.atomic.AtomicLong();
     }
 
     private final Stats stats = new Stats();
@@ -425,8 +640,28 @@ public final class DhtClient implements DhtStore, AutoCloseable {
     public String statsLine() {
         return "DHT: " + known.size() + " nodes known, " + stats.replies.get() + " replies, "
                 + stats.timeouts.get() + " no-reply, " + stats.putsStored.get() + " records stored, "
-                + stats.putsFailed.get() + " stores failed, " + stats.fullLookups.get() + " full searches, "
+                + stats.putsFailed.get() + " stores failed, " + stats.fullLookups.get() + " full searches ("
+                + stats.renewals.get() + " background renewals), "
                 + (stats.fastGets.get() + stats.fastPuts.get()) + " fast (remembered route)";
+    }
+
+    /**
+     * Nodes that answered with a write token and are, as far as we know so far, among the closest: store any
+     * carried records on them right away instead of waiting for the search to finish.
+     */
+    private void storeAsWeGo(Lookup result, Map<InetSocketAddress, Candidate> cands, Comparator<Candidate> byDistance) {
+        Map<InetSocketAddress, Responder> byAddress = new HashMap<>();
+        for (Responder r : result.responders) if (r.token != null) byAddress.putIfAbsent(r.node.address(), r);
+        List<Responder> eligible = new ArrayList<>();
+        cands.values().stream().filter(c -> c.node.id() != null && !c.useless).sorted(byDistance).limit(STORE_NODES)
+                .forEach(c -> {
+                    Responder r = byAddress.get(c.node.address());
+                    if (r != null) eligible.add(r);
+                });
+        synchronized (result) {
+            result.eligible = List.copyOf(eligible);
+            for (MutableItem item : result.carry) for (Responder r : eligible) storeOn(result, item, r);
+        }
     }
 
     private void handleGetReply(Map<String, Object> r, Candidate c, byte[] target, byte[] expectedKey,
@@ -561,6 +796,8 @@ public final class DhtClient implements DhtStore, AutoCloseable {
     @Override
     public void close() {
         closed = true;
+        maintainer.shutdownNow();
+        refresher.shutdownNow();
         socket.close();
         pending.values().forEach(p -> p.future.cancel(false));
     }
