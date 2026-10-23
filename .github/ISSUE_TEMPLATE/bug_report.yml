@@ -1,0 +1,87 @@
+name: Bug report
+description: Something in CinderLink isn't working as it should
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill in as much as you can.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the problem.
+      placeholder: My friend shows as offline even though they're in a world...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can we make it happen again?
+      placeholder: |
+        1. Open the Friends list
+        2. Click ...
+        3. See ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: role
+    attributes:
+      label: Were you hosting or joining?
+      options:
+        - Hosting
+        - Joining
+        - Neither (friends list, requests, settings...)
+    validations:
+      required: true
+
+  - type: input
+    id: cinderlink-version
+    attributes:
+      label: CinderLink version
+      placeholder: "0.1.7"
+    validations:
+      required: true
+
+  - type: input
+    id: minecraft-version
+    attributes:
+      label: Minecraft and NeoForge version
+      placeholder: "1.21.1, NeoForge 21.1.264"
+    validations:
+      required: true
+
+  - type: input
+    id: modpack
+    attributes:
+      label: Modpack or other mods
+      description: The modpack name, or any other mods you have installed.
+      placeholder: "None / Modpack name / list of mods"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log file
+      description: |
+        Please attach `latest.log` from your game's `logs` folder (drag the file into this box).
+        CinderLink keeps IP addresses out of the log, so it's safe to share.
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Screenshots, your type of connection (home Wi-Fi, mobile hotspot, school network...), or anything else that might help.

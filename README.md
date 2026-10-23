@@ -1,12 +1,14 @@
 # CinderLink
 
-Play your singleplayer worlds with friends over the internet. Add friends once, then join them by clicking
-their name. No servers, no accounts, and no addresses to copy or paste.
+Play your singleplayer worlds with friends over the internet. Add friends once, then see when they're online
+or hosting and join them with one click. No servers, no accounts, and no addresses to copy or paste.
 
 - **Client-only** NeoForge mod for Minecraft 1.21.1 (1.20.1 backport planned)
 - **Serverless friends list** over the BitTorrent DHT: nothing to host, nothing that can go down
 - **Encrypted presence:** only your friends can see you're online or hosting
-- **Click to join:** connection details travel inside encrypted records and are never shown or logged
+- **One-click Join:** connection details travel inside encrypted records and are never shown or logged
+- **Fast:** requests, accepts and hosting status typically arrive within 1-2 seconds
+- **Skins:** friends' faces in the list, and your player model on the main menu (can be turned off)
 
 ## How players use it
 
@@ -16,17 +18,23 @@ their name. No servers, no accounts, and no addresses to copy or paste.
    (it starts at *LAN only* every time) > **Start LAN World**.
 4. Your friends see you **Hosting: World Name** with a **Join** button. One click and they're in.
 
+Hosting for friends outside your network needs UPnP on the router (or IPv6). Without it, the world is shown as
+"can't be reached" and only friends on your own network can join. Joining works on any normal connection.
+
 A Cinder Code isn't an address and can't be used to find you. **Reset Code** makes old codes stop working
 without affecting existing friends.
 
 ## Security and privacy
 
 - Your identity is a keypair in `~/.cinderlink` (outside every game instance, so modpacks can never ship it).
+  Your friends list and `skins.txt` (which skin each friend wears; public info only) live there too.
 - Every record on the DHT is signed and encrypted. Per-friend records live at locations only that friend
   can compute. Outsiders can't find, read, forge or link them.
 - While hosting, only the friends picked for that session can log in (checked against their Mojang-verified
   account before they receive any world data). Logged-in Minecraft account required.
-- IP addresses are kept out of `latest.log` on both the host and joining side.
+- IP addresses are kept out of `latest.log` on both the host and joining side. Timing lines
+  (`CinderLink timing:`) contain only durations and counts, so logs are safe to share for support.
+- Skins are fetched from Mojang by account UUID, exactly as the game does for players you see in-game.
 - Networks that block the DHT (schools, many workplaces) simply show the friends list as unavailable;
   CinderLink doesn't try to get around them.
 - The one unavoidable exposure: a friend you let join connects directly, so their game knows your IP
@@ -45,7 +53,7 @@ src/main/java/dev/devilswarchild/cinderlink/
     util/      log redaction, safe file writes
   hosting/     JoinGate (who may log in), shared by client and integrated server
   mixin/       login check, IP-free logging
-  client/      screens, Open to LAN controls, hosting, click-to-join
+  client/      screens, Open to LAN controls, hosting, joining, skins and the menu player model
 ```
 
 The `core/` rule is what keeps the 1.20.1 backport cheap: only `client/` and `mixin/` get rewritten.
