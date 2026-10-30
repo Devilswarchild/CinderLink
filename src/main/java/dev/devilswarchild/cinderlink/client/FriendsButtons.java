@@ -29,22 +29,25 @@ public final class FriendsButtons {
         Component label = requests > 0
                 ? Component.translatable("cinderlink.button.friends_count", requests)
                 : Component.translatable("cinderlink.button.friends");
-        event.addListener(Button.builder(label, b -> screen.getMinecraft().setScreen(new FriendsScreen(screen)))
-                .bounds(6, 6, 80, 20).build());
-        if (title && CinderLinkConfig.SHOW_PLAYER_MODEL.get()) addPlayerModel(event, screen);
+        Button friends = Button.builder(label, b -> screen.getMinecraft().setScreen(new FriendsScreen(screen)))
+                .bounds(6, 6, 80, 20).build();
+        event.addListener(friends);
+        if (title && CinderLinkConfig.SHOW_PLAYER_MODEL.get()) addPlayerModel(event, screen, friends);
         // Get friends' faces ready now, so the friends list shows them straight away.
         FriendsRuntime.presence().ifPresent(p -> Skins.prefetch(p.store().all().stream()
                 .map(Friend::mcUuid).toList()));
     }
 
-    /** Your player model to the right of the main menu buttons, if there's room. */
-    private static void addPlayerModel(ScreenEvent.Init.Post event, Screen screen) {
-        int buttonsTop = screen.height / 4 + 48;  // where vanilla puts the first title-screen button
-        int height = 104;                        // from the first button to the bottom of the last row
+    /**
+     * Your player model just under the Friends button, out of the way of the main menu buttons (modpacks often
+     * restyle those), if there's room.
+     */
+    private static void addPlayerModel(ScreenEvent.Init.Post event, Screen screen, Button friends) {
         int width = 56;
-        int x = screen.width / 2 + 100 + 24;     // just right of the 200-wide button column
-        if (x + width > screen.width - 4 || buttonsTop + height > screen.height - 14) return; // too small
-        event.addListener(new PlayerModelWidget(x, buttonsTop, width, height,
-                screen.getMinecraft().getEntityModels()));
+        int height = 104;
+        int x = friends.getX() + (friends.getWidth() - width) / 2; // centred under the button
+        int y = friends.getY() + friends.getHeight() + 6;
+        if (y + height > screen.height - 14) return; // too small
+        event.addListener(new PlayerModelWidget(x, y, width, height, screen.getMinecraft().getEntityModels()));
     }
 }

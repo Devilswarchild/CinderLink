@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
@@ -31,6 +32,11 @@ final class Skins {
 
     /** A failed lookup (offline, rate-limited) is retried after this long. */
     private static final long RETRY_MS = 10 * 60_000;
+    /**
+     * Mojang's skin server sometimes just doesn't answer for a moment. Before giving up on a lookup, try again
+     * after each of these pauses.
+     */
+    private static final long[] QUICK_RETRY_MS = {2_000, 5_000};
 
     private record Entry(CompletableFuture<PlayerSkin> skin, long startedAt) {}
 
@@ -70,22 +76,27 @@ final class Skins {
         Minecraft mc = Minecraft.getInstance();
         CompletableFuture<PlayerSkin> f = mine;
         if (f == null) {
-            // getGameProfile() can wait on Mojang, so never call it on the render thread.
+            // Use the skin the game already looked up at startup, if it got one. getGameProfile() can wait on
+            // Mojang, so never call it on the render thread.
             f = CompletableFuture.supplyAsync(mc::getGameProfile, Util.nonCriticalIoPool())
-                    .thenCompose(p -> mc.getSkinManager().getOrLoad(p))
+                    .thenCompose(p -> p.getProperties().containsKey("textures")
+                            ? mc.getSkinManager().getOrLoad(p)
+                            : CompletableFuture.completedFuture((PlayerSkin) null))
                     .exceptionally(t -> null);
             mine = f;
         }
         PlayerSkin s = f.getNow(null);
-        return s != null ? s : DefaultPlayerSkin.get(mc.getUser().getProfileId());
+        if (s != null) return s;
+        // The game's own lookup failed (or isn't back yet): look yourself up like a friend, which retries
+        // and shows the skin saved from last time straight away.
+        return of(mc.getUser().getProfileId());
     }
 
     private static CompletableFuture<PlayerSkin> load(UUID uuid) {
         Minecraft mc = Minecraft.getInstance();
         loadSaved();
         // Ask Mojang in the background either way, in case they've changed skin since last time.
-        CompletableFuture<PlayerSkin> fresh = CompletableFuture
-                .supplyAsync(() -> mc.getMinecraftSessionService().fetchProfile(uuid, false), Util.nonCriticalIoPool())
+        CompletableFuture<PlayerSkin> fresh = fetchProfile(uuid, 0)
                 .thenCompose((ProfileResult r) -> {
                     if (r == null) return CompletableFuture.completedFuture((PlayerSkin) null);
                     GameProfile p = r.profile();
@@ -108,6 +119,24 @@ final class Skins {
                     new Entry(CompletableFuture.completedFuture(s), e.startedAt));
         });
         return quick;
+    }
+
+    /**
+     * Looks a player up on Mojang's skin server, trying again after a short pause if it doesn't answer.
+     * Completes with null if every try fails. Asks for the signed profile on purpose: the game caches unsigned
+     * lookups, failures included, so a retry through that path could just get the cached failure back.
+     */
+    private static CompletableFuture<ProfileResult> fetchProfile(UUID uuid, int attempt) {
+        Minecraft mc = Minecraft.getInstance();
+        return CompletableFuture
+                .supplyAsync(() -> mc.getMinecraftSessionService().fetchProfile(uuid, true), Util.nonCriticalIoPool())
+                .exceptionally(t -> null)
+                .thenCompose(r -> {
+                    if (r != null || attempt >= QUICK_RETRY_MS.length) return CompletableFuture.completedFuture(r);
+                    return CompletableFuture.supplyAsync(() -> null, CompletableFuture.delayedExecutor(
+                                    QUICK_RETRY_MS[attempt], TimeUnit.MILLISECONDS, Util.nonCriticalIoPool()))
+                            .thenCompose(ignored -> fetchProfile(uuid, attempt + 1));
+                });
     }
 
     private static Path file() {
@@ -133,7 +162,7 @@ final class Skins {
     }
 
     private static synchronized void save() {
-        StringBuilder sb = new StringBuilder("# CinderLink: which skin each friend wears (public skin info). uuid|textures\n");
+        StringBuilder sb = new StringBuilder("# CinderLink: which skin you and each friend wear (public skin info). uuid|textures\n");
         SAVED.forEach((u, v) -> sb.append(u).append('|').append(v).append('\n'));
         try {
             SecureFiles.writeAtomically(file(), sb.toString().getBytes(StandardCharsets.UTF_8));

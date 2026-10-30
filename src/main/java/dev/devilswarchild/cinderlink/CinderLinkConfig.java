@@ -21,7 +21,7 @@ public final class CinderLinkConfig {
             .define("showHostingToasts", true);
     static { BUILDER.pop(); BUILDER.push("menu"); }
     public static final ModConfigSpec.BooleanValue SHOW_PLAYER_MODEL = BUILDER
-            .comment("Show your player model to the right of the main menu buttons.")
+            .comment("Show your player model on the main menu, under the Friends button.")
             .define("showPlayerModel", true);
     static { BUILDER.pop(); }
 
